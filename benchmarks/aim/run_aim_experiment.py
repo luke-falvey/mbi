@@ -278,6 +278,54 @@ class InstrumentedAIM(aim_mod.AIM):
     return model, synth
 
 
+def run_optimized(args, data, workload, log):
+  """Run the optimized mechanisms/aim.py AIM with coarse phase timers."""
+  timer = Timer()
+  sel_count = [0]
+
+  class TimedAIM(aim_mod.AIM):
+
+    def _estimate(self, domain, measurements, warm_start=None, iters=None):
+      t0 = time.perf_counter()
+      c0 = compile_seconds()
+      model = super()._estimate(domain, measurements, warm_start, iters)
+      jax.block_until_ready(model.marginals)
+      timer.add("fit", time.perf_counter() - t0)
+      timer.add("fit/jit_compile", compile_seconds() - c0)
+      return model
+
+    def worst_approximated(self, *a, **k):
+      t0 = time.perf_counter()
+      c0 = compile_seconds()
+      out = super().worst_approximated(*a, **k)
+      timer.add("select/worst_approximated", time.perf_counter() - t0)
+      timer.add("select/jit_compile", compile_seconds() - c0)
+      sel_count[0] += 1
+      log({"event": "round", "round": sel_count[0], "selected": list(out),
+           "t_elapsed": time.perf_counter() - T0})
+      return out
+
+  orig = mbi.MarkovRandomField.synthetic_data
+
+  def timed_synth(self, *a, **k):
+    t0 = time.perf_counter()
+    out = orig(self, *a, **k)
+    timer.add("generate/synthetic_data", time.perf_counter() - t0)
+    return out
+
+  mbi.MarkovRandomField.synthetic_data = timed_synth
+  mech = TimedAIM(
+      args.epsilon, 1e-9, max_model_size=args.max_model_size,
+      max_iters=args.max_iters, prng=np.random.RandomState(args.seed),
+  )
+  T0 = time.perf_counter()
+  model, synth = mech.run(data, workload, num_synth_rows=args.rows)
+  mbi.MarkovRandomField.synthetic_data = orig
+  mech.timer = timer
+  mech.rounds_run = sel_count[0]
+  return mech, model, synth
+
+
 def main():
   p = argparse.ArgumentParser()
   p.add_argument("--rows", type=int, required=True)
@@ -289,6 +337,10 @@ def main():
   p.add_argument("--seed", type=int, default=0)
   p.add_argument("--name", default="")
   p.add_argument("--out", required=True)
+  p.add_argument("--impl", choices=["reference", "optimized"],
+                 default="reference",
+                 help="reference: original AIM logic with per-phase timers; "
+                 "optimized: mechanisms/aim.py AIM as-is")
   args = p.parse_args()
 
   fh = open(args.out, "a")
@@ -313,13 +365,16 @@ def main():
 
   workload = [(cl, 1.0) for cl in itertools.combinations(domain, 2)]
   np.random.seed(args.seed)
-  mech = InstrumentedAIM(
-      args.epsilon, 1e-9, max_model_size=args.max_model_size,
-      max_iters=args.max_iters, log=log,
-      prng=np.random.RandomState(args.seed),
-  )
   t0 = time.perf_counter()
-  model, synth = mech.run(data, workload, num_synth_rows=args.rows)
+  if args.impl == "optimized":
+    mech, model, synth = run_optimized(args, data, workload, log)
+  else:
+    mech = InstrumentedAIM(
+        args.epsilon, 1e-9, max_model_size=args.max_model_size,
+        max_iters=args.max_iters, log=log,
+        prng=np.random.RandomState(args.seed),
+    )
+    model, synth = mech.run(data, workload, num_synth_rows=args.rows)
   t_aim = time.perf_counter() - t0
 
   # quality: avg total-variation error over 2-way workload

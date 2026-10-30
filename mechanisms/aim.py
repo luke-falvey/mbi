@@ -7,6 +7,17 @@ the runtime /utility tradeoff via the max_model_size flag.  We recommend setting
 for debugging, but keeping the default value of 80 for any official comparisons to this mechanism.
 
 Note that we assume in this file that the data has been appropriately preprocessed so that there are no large-cardinality categorical attributes.  If there are, we recommend using something like "compress_domain" from mst.py.  Since our paper evaluated already-preprocessed datastes, we did not implement that here for simplicity.
+
+Performance notes: AIM fits a differently-structured model every round, so with
+default JAX settings almost all of its runtime is spent compiling XLA programs
+(see benchmarks/aim/REPORT.md).  This implementation avoids most of that by
+(1) scoring candidates with NumPy instead of JIT-compiled JAX code,
+(2) merging repeated measurements of the same clique so the fitted program's
+structure (and compile cache entry) is reused, (3) fitting with
+``MirrorDescent(fuse_steps=False)``, which compiles ~5x faster, optionally with
+``fast_compile`` for small models, and (4) periodically clearing JAX's caches so
+long runs don't exhaust the process's memory-map limit.  None of these change
+the selected cliques or the fitted model beyond floating-point rounding.
 """
 
 import numpy as np
@@ -15,13 +26,16 @@ import os as _os
 import sys as _sys
 
 _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import jax
 from mbi import (
     Dataset,
     Domain,
     estimation,
     junction_tree,
+    marginal_oracles,
     LinearMeasurement,
 )
+from mbi.marginal_loss import DatavectorQuery
 from mechanism import Mechanism
 from collections import defaultdict
 from scipy.optimize import bisect
@@ -59,20 +73,107 @@ def compile_workload(workload):
     return {cl: score(cl) for cl in downward_closure(workload_cliques)}
 
 
-def filter_candidates(candidates, model, size_limit):
+def filter_candidates(candidates, model, size_limit, size_cache=None):
+    """Keep candidates that fit under ``size_limit`` or are already supported.
+
+    ``size_cache`` (optional dict) memoizes junction-tree sizes across calls;
+    AIM often revisits the same model structure (e.g. when it re-measures a
+    clique), so the same sizes get recomputed otherwise.
+    """
     ans = {}
-    free_cliques = downward_closure(model.cliques)
+    free_cliques = set(downward_closure(model.cliques))
+    model_cliques = tuple(model.cliques)
     for cl in candidates:
-        cond1 = (
-            junction_tree.hypothetical_model_size(
-                model.domain, list(model.cliques) + [cl]
+        key = (model_cliques, cl)
+        if size_cache is not None and key in size_cache:
+            size = size_cache[key]
+        else:
+            size = junction_tree.hypothetical_model_size(
+                model.domain, list(model_cliques) + [cl]
             )
-            <= size_limit
-        )
+            if size_cache is not None:
+                size_cache[key] = size
+        cond1 = size <= size_limit
         cond2 = cl in free_cliques
         if cond1 or cond2:
             ans[cl] = candidates[cl]
     return ans
+
+
+def merge_measurements(measurements):
+    """Combine identity measurements of the same clique into one.
+
+    Measurements ``y_i ~ N(x, s_i^2)`` of the same marginal are replaced by their
+    precision-weighted mean ``y = (sum_i y_i / s_i^2) / P`` with standard
+    deviation ``1 / sqrt(P)``, where ``P = sum_i 1 / s_i^2``.  The squared-error
+    loss changes only by an additive constant, so its gradient, the estimated
+    total and the Lipschitz constant (and hence the fitted model) are unchanged.
+    Keeping one term per clique means re-measuring a clique doesn't change the
+    structure of the compiled estimation program, so it is reused.
+
+    Measurements with non-identity queries are passed through unchanged.
+    """
+    groups = {}
+    order = []
+    for m in measurements:
+        if isinstance(m.query, DatavectorQuery):
+            key = (m.clique, m.query)
+            if key not in groups:
+                groups[key] = []
+                order.append(key)
+            groups[key].append(m)
+        else:
+            order.append(m)
+    merged = []
+    for key in order:
+        if isinstance(key, LinearMeasurement):
+            merged.append(key)
+            continue
+        group = groups[key]
+        if len(group) == 1:
+            merged.append(group[0])
+            continue
+        precisions = [1.0 / float(m.stddev) ** 2 for m in group]
+        total_precision = sum(precisions)
+        y = sum(
+            p * np.asarray(m.noisy_measurement, dtype=np.float64)
+            for p, m in zip(precisions, group)
+        ) / total_precision
+        merged.append(
+            LinearMeasurement(
+                y, key[0], stddev=1.0 / np.sqrt(total_precision), query=key[1]
+            )
+        )
+    return merged
+
+
+class _NumpyMarginals:
+    """Answers marginal queries on a fitted model with NumPy (no JIT)."""
+
+    def __init__(self, model):
+        self.model = model
+        self.tables = {}
+
+    def datavector(self, cl):
+        model = self.model
+        if model.marginals.supports(cl):
+            parent = model.marginals.parent(cl)
+            if parent not in self.tables:
+                self.tables[parent] = np.asarray(
+                    model.marginals[parent].values, dtype=np.float64
+                )
+            table = self.tables[parent]
+            axes = tuple(i for i, a in enumerate(parent) if a not in cl)
+            reduced = table.sum(axis=axes) if axes else table
+            kept = [a for a in parent if a in cl]
+            reduced = np.transpose(reduced, [kept.index(a) for a in cl])
+            return reduced.reshape(-1)
+        return np.asarray(
+            marginal_oracles.variable_elimination_numpy(
+                model.potentials, cl, float(model.total)
+            ).values,
+            dtype=np.float64,
+        ).reshape(-1)
 
 
 class AIM(Mechanism):
@@ -86,7 +187,31 @@ class AIM(Mechanism):
         max_model_size=80,
         max_iters=1000,
         structural_zeros={},
+        fuse_steps=False,
+        fast_compile_max_cells=100_000,
+        clear_caches_every=25,
+        parallel_compile=None,
+        intermediate_iters=None,
     ):
+        """
+        :param fuse_steps: passed to ``MirrorDescent``.  ``False`` (default)
+            compiles much faster, which is what dominates AIM's runtime.
+        :param fast_compile_max_cells: fit with ``MirrorDescent(fast_compile=True)``
+            while the model's junction tree has at most this many cells (where
+            compile time dwarfs compute time).  Set to 0 to disable.
+        :param clear_caches_every: call ``jax.clear_caches()`` every this many
+            rounds, releasing compiled programs for model structures that won't
+            be seen again.  Set to ``None`` to disable.
+        :param parallel_compile: passed to ``MirrorDescent``; compiles the
+            independent programs of each fit concurrently.  Defaults to ``True``
+            when more than one CPU is available.
+        :param intermediate_iters: maximum MirrorDescent iterations for the
+            fits in intermediate rounds (the initial and final fits always use
+            ``max_iters``).  Those fits only guide which clique to measure next
+            and are warm-started from the previous round, so a smaller value
+            trades a little selection accuracy for speed.  Defaults to
+            ``max_iters`` (no change in behaviour).
+        """
         super(AIM, self).__init__(
             epsilon, delta, bounded=False, prng=prng or np.random
         )
@@ -94,15 +219,43 @@ class AIM(Mechanism):
         self.max_iters = max_iters
         self.max_model_size = max_model_size
         self.structural_zeros = structural_zeros
+        self.fuse_steps = fuse_steps
+        self.fast_compile_max_cells = fast_compile_max_cells
+        self.clear_caches_every = clear_caches_every
+        if parallel_compile is None:
+            if hasattr(_os, "sched_getaffinity"):
+                ncpu = len(_os.sched_getaffinity(0))
+            else:
+                ncpu = _os.cpu_count() or 1
+            parallel_compile = ncpu > 1
+        self.parallel_compile = parallel_compile
+        self.intermediate_iters = intermediate_iters or max_iters
+
+    def _estimate(self, domain, measurements, warm_start=None, iters=None):
+        cliques = list({m.clique for m in measurements})
+        jtree, _ = junction_tree.make_junction_tree(domain, cliques)
+        cells = sum(domain.size(cl) for cl in junction_tree.maximal_cliques(jtree))
+        estimator = estimation.MirrorDescent(
+            fuse_steps=self.fuse_steps,
+            fast_compile=cells <= self.fast_compile_max_cells,
+            parallel_compile=self.parallel_compile,
+        )
+        return estimator.estimate(
+            domain,
+            merge_measurements(measurements),
+            iters=iters or self.max_iters,
+            warm_start=warm_start,
+        )
 
     def worst_approximated(self, candidates, answers, model, eps, sigma):
         errors = {}
         sensitivity = {}
+        marginals = _NumpyMarginals(model)
         for cl in candidates:
             wgt = candidates[cl]
             x = answers[cl]
             bias = np.sqrt(2 / np.pi) * sigma * model.domain.size(cl)
-            xest = model.project(cl).datavector()
+            xest = marginals.datavector(cl)
             errors[cl] = wgt * (np.linalg.norm(x - xest, 1) - bias)
             sensitivity[cl] = abs(wgt)
 
@@ -114,7 +267,10 @@ class AIM(Mechanism):
     def run(self, data, workload, num_synth_rows=None, initial_cliques=None):
         rounds = self.rounds or 16 * len(data.domain)
         candidates = compile_workload(workload)
-        answers = {cl: data.project(cl).datavector() for cl in candidates}
+        answers = {
+            cl: np.asarray(data.project(cl).datavector()) for cl in candidates
+        }
+        size_cache = {}
 
         if not initial_cliques:
             initial_cliques = [
@@ -136,16 +292,14 @@ class AIM(Mechanism):
 
         zeros = self.structural_zeros
         # NOTE: Haven't incorproated structural zeros back yet after refactoring
-        model = estimation.MirrorDescent().estimate(
-            data.domain,
-            measurements,
-            iters=self.max_iters,
-        )
+        model = self._estimate(data.domain, measurements)
 
         t = 0
         terminate = False
         while not terminate:
             t += 1
+            if self.clear_caches_every and t % self.clear_caches_every == 0:
+                jax.clear_caches()
             if self.rho - rho_used < 2 * (
                 0.5 / sigma**2 + 1.0 / 8 * epsilon**2
             ):
@@ -159,7 +313,9 @@ class AIM(Mechanism):
             print("Budget Used", rho_used, "/", self.rho)
             size_limit = self.max_model_size * rho_used / self.rho
 
-            small_candidates = filter_candidates(candidates, model, size_limit)
+            small_candidates = filter_candidates(
+                candidates, model, size_limit, size_cache
+            )
             cl = self.worst_approximated(
                 small_candidates, answers, model, epsilon, sigma
             )
@@ -168,19 +324,19 @@ class AIM(Mechanism):
             x = data.project(cl).datavector()
             y = x + self.gaussian_noise(sigma, n)
             measurements.append(LinearMeasurement(y, cl, stddev=sigma))
-            z = model.project(cl).datavector()
+            z = _NumpyMarginals(model).datavector(cl)
 
             # Warm start potentials from prior round
             # TODO: check if it helps to call maximal_subsets here
             pcliques = list(set(M.clique for M in measurements))
             potentials = model.potentials.expand(pcliques)
-            model = estimation.MirrorDescent().estimate(
+            model = self._estimate(
                 data.domain,
                 measurements,
-                iters=self.max_iters,
                 warm_start=potentials,
+                iters=self.intermediate_iters,
             )
-            w = model.project(cl).datavector()
+            w = _NumpyMarginals(model).datavector(cl)
             # print('Selected',cl,'Size',n,'Budget Used',rho_used/self.rho)
             if np.linalg.norm(w - z, 1) <= sigma * np.sqrt(2 / np.pi) * n:
                 print("(!!!!!!!!!!!!!!!!!!!!!!) Reducing sigma", sigma / 2)
@@ -188,11 +344,8 @@ class AIM(Mechanism):
                 epsilon *= 2
 
         print("Generating Data...")
-        model = estimation.MirrorDescent().estimate(
-            data.domain,
-            measurements,
-            iters=self.max_iters,
-            warm_start=potentials,
+        model = self._estimate(
+            data.domain, measurements, warm_start=potentials
         )
         synth = model.synthetic_data(rows=num_synth_rows)
 

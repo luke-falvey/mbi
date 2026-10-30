@@ -824,6 +824,89 @@ def variable_elimination(
   return unnormalized.normalize(total, log=True).exp().project(clique)
 
 
+def _np_align(attrs, values, target):
+  """Transpose/reshape a NumPy table over ``attrs`` to broadcast over ``target``."""
+  present = [a for a in target if a in attrs]
+  values = np.transpose(values, [attrs.index(a) for a in present])
+  shape, it = [], iter(values.shape)
+  for a in target:
+    shape.append(next(it) if a in attrs else 1)
+  return values.reshape(shape)
+
+
+def _np_logsumexp(values, axis):
+  """Stable log-sum-exp that returns ``-inf`` for all ``-inf`` slices."""
+  m = np.max(values, axis=axis, keepdims=True)
+  m = np.where(np.isfinite(m), m, 0.0)
+  with np.errstate(divide="ignore"):
+    out = np.log(np.sum(np.exp(values - m), axis=axis, keepdims=True)) + m
+  return np.squeeze(out, axis=axis)
+
+
+def variable_elimination_numpy(
+    potentials: CliqueVector,
+    clique: Sequence[Attribute],
+    total: float = 1.0,
+) -> Factor:
+  """NumPy implementation of :func:`variable_elimination` (no JIT).
+
+  Computes the same marginal as ``variable_elimination`` (same elimination
+  order, float64 arithmetic) without tracing or compiling anything. The jitted
+  version compiles a new XLA program for every distinct (clique, model
+  structure) pair, which dominates the runtime of workflows that query many
+  out-of-model marginals on many different models, such as candidate scoring
+  in AIM. For the small-to-medium tables involved there, NumPy is faster
+  end-to-end.
+
+  Only supports concrete (non-traced) potentials without constraints or
+  evidence; use :func:`variable_elimination` for those cases.
+
+  Args:
+      potentials: The (log-space) potentials of a graphical model.
+      clique: The attributes whose marginal you want.
+      total: The normalization factor.
+
+  Returns:
+      A Factor over ``clique`` (in the given order) summing to ``total``.
+  """
+  clique = tuple(clique)
+  psi = {
+      i: (tuple(f.domain.attributes), np.asarray(f.values, dtype=np.float64))
+      for i, f in enumerate(potentials.tables.values())
+  }
+  k = len(psi)
+  domain = potentials.active_domain
+  cliques = [attrs for attrs, _ in psi.values()] + [clique]
+  elim = domain.invert(clique)
+  elim_order, _ = junction_tree.greedy_order(domain, cliques, elim=elim)
+
+  def combine(factors):
+    attrs = []
+    for fa, _ in factors:
+      attrs.extend(a for a in fa if a not in attrs)
+    out = np.zeros([1] * len(attrs))
+    for fa, fv in factors:
+      out = out + _np_align(fa, fv, attrs)
+    return tuple(attrs), out
+
+  for z in elim_order:
+    group = [psi.pop(i) for i in list(psi) if z in psi[i][0]]
+    attrs, vals = combine(group) if group else ((), np.zeros(()))
+    if z in attrs:
+      ax = attrs.index(z)
+      vals = _np_logsumexp(vals, axis=ax)
+      attrs = attrs[:ax] + attrs[ax + 1 :]
+    psi[k] = (attrs, vals)
+    k += 1
+
+  attrs, vals = combine(list(psi.values())) if psi else ((), np.zeros(()))
+  shape = potentials.domain.project(clique).shape
+  logp = np.broadcast_to(_np_align(attrs, vals, list(clique)), shape)
+  logz = _np_logsumexp(logp.reshape(-1), axis=0)
+  values = np.exp(logp - logz + np.log(total))
+  return Factor(potentials.domain.project(clique), jnp.asarray(values))
+
+
 def precompile_bulk_variable_elimination(
     domain: Domain,
     potential_cliques: Sequence[Clique],

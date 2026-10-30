@@ -8,6 +8,7 @@ generating synthetic data.
 """
 
 from collections.abc import Sequence
+import math
 
 import chex
 import numpy as np
@@ -21,6 +22,39 @@ from .dataset import Dataset
 from .domain import Attribute
 from .domain import Domain
 from .factor import Factor
+
+
+# Use a dense bincount over all parent configurations when there are at most
+# this many of them; otherwise fall back to a 1-D sort-based np.unique.
+_DENSE_GROUPING_LIMIT = 1 << 24
+
+
+def _group_rows(rows: np.ndarray, sizes: tuple[int, ...]):
+  """Fast equivalent of ``np.unique(rows, axis=0, ...)`` plus a stable argsort.
+
+  Returns ``(uniques, inverse, counts, perm)`` where the first three match
+  ``np.unique(rows, axis=0, return_inverse=True, return_counts=True)`` and
+  ``perm == np.argsort(inverse, kind="stable")``.  Each row is encoded as a
+  single integer (row-major, so integer order equals lexicographic row order),
+  which avoids ``np.unique``'s slow multi-column sort.  Group ids are sorted
+  in the smallest unsigned dtype so NumPy can use radix sort.
+  """
+  keys = np.ravel_multi_index(tuple(rows.T), sizes)
+  n_configs = math.prod(sizes)
+  if n_configs <= _DENSE_GROUPING_LIMIT:
+    full_counts = np.bincount(keys, minlength=n_configs)
+    present = full_counts > 0
+    unique_keys = np.flatnonzero(present)
+    inverse = (np.cumsum(present) - 1)[keys]
+    counts = full_counts[unique_keys]
+  else:
+    unique_keys, inverse, counts = np.unique(
+        keys, return_inverse=True, return_counts=True
+    )
+  small = inverse.astype(np.min_scalar_type(max(len(unique_keys) - 1, 0)))
+  perm = np.argsort(small, kind="stable")
+  uniques = np.stack(np.unravel_index(unique_keys, sizes), axis=-1)
+  return uniques, inverse.astype(np.intp), counts, perm
 
 
 @chex.dataclass(frozen=True, kw_only=False)
@@ -152,14 +186,9 @@ class MarkovRandomField:
         )
         cond_cdfs = cond_probs.cumsum(axis=-1)
 
-        uniques, inverse, counts = np.unique(
-            current_proj_data,
-            axis=0,
-            return_inverse=True,
-            return_counts=True,
+        uniques, inverse, counts, perm = _group_rows(
+            current_proj_data, tuple(self.domain[c] for c in proj)
         )
-
-        perm = np.argsort(inverse, kind="stable")
         if method == "sample":
           u = np.random.rand(total)
         else:

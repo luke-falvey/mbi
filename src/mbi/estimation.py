@@ -96,6 +96,13 @@ def primal_dual_gap(
   return gap / scale if normalize else gap
 
 
+# One compiled program per model structure for the convergence check, instead
+# of an op-by-op (eager) gradient plus a separately compiled oracle call.
+_jitted_primal_dual_gap = jax.jit(
+    primal_dual_gap, static_argnames=("marginal_oracle", "normalize")
+)
+
+
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class Estimator(ABC):
   """An object that estimates a Model from a marginal-based loss function.
@@ -111,6 +118,23 @@ class Estimator(ABC):
   Attributes:
       marginal_oracle: Callable for computing marginals from potentials.
           If ``None``, auto-selected via ``default_oracle()``.
+      fuse_steps: If ``True`` (default), ``CALLBACK_EVERY`` optimization steps
+          are compiled into a single fused ``lax.scan`` program. This gives the
+          lowest per-step overhead, but XLA's CPU compiler is several times
+          slower on loop bodies, so the one-time compile is much longer. If
+          ``False``, a single step is compiled and called from a Python loop:
+          compilation is ~5x faster at the cost of a small per-step dispatch
+          overhead. Prefer ``False`` when many differently-structured models
+          are each fit once (e.g. inside AIM), where compile time dominates.
+      fast_compile: If ``True``, compile the optimization step with XLA's
+          backend optimizations disabled. Compilation is ~3-4x faster but each
+          step runs ~2-3x slower, so this only pays off for small models where
+          compile time dominates. Defaults to ``False``.
+      parallel_compile: If ``True``, ``estimate`` compiles the optimization
+          step and the convergence check on background threads while the
+          estimator initializes, so the independent XLA compilations run
+          concurrently on multi-core machines. Results are unchanged.
+          Defaults to ``False``.
 
   Examples of subclasses:
       * ``MirrorDescent``
@@ -121,6 +145,9 @@ class Estimator(ABC):
   """
 
   marginal_oracle: marginal_oracles.MarginalOracle | None = None
+  fuse_steps: bool = True
+  fast_compile: bool = False
+  parallel_compile: bool = False
 
   # ------------------------------------------------------------------
   # Abstract interface — subclasses must implement
@@ -220,6 +247,13 @@ class Estimator(ABC):
           constraints=constraints,
       )
 
+    pending = (
+        self._compile_in_background(
+            domain, loss_fn, known_total, constraints, warm_start, tol
+        )
+        if self.parallel_compile
+        else []
+    )
     state = self._init(
         domain,
         loss_fn,
@@ -229,29 +263,96 @@ class Estimator(ABC):
     )
     # De-alias so that donate_argnames in _multi_step is safe.
     state = jax.tree.map(jnp.copy, state)
+    for future in pending:
+      # Wait so the first call hits the compiled executable instead of starting
+      # a duplicate compile. Failures fall back to compiling on first call.
+      try:
+        future.result()
+      except Exception:  # pylint: disable=broad-exception-caught
+        pass
     prev_gap = np.inf
     for _ in range(math.ceil(iters / CALLBACK_EVERY)):
-      state = self._multi_step(state, loss_fn, known_total, constraints)
+      state = self._run_block(state, loss_fn, known_total, constraints)
       mu = self._callback_value(state, known_total, constraints)
       if callback_fn is not None:
         callback_fn(mu)
       if tol is not None:
         if not isinstance(mu, CliqueVector):
           mu = CliqueVector.from_projectable(mu, loss_fn.cliques)
-        gap = primal_dual_gap(loss_fn, mu, self.marginal_oracle, constraints)
+        gap = _jitted_primal_dual_gap(
+            loss_fn, mu, self.marginal_oracle, constraints
+        )
         if gap <= tol or gap == prev_gap:
           break
         prev_gap = float(gap)
     return self._finalize(state, known_total, constraints=constraints)
 
-  @jax.jit(static_argnames=["self"], donate_argnames=["state"])
-  def _multi_step(self, state, loss_fn, known_total, constraints=()):
+  def _compile_in_background(
+      self, domain, loss_fn, known_total, constraints, warm_start, tol
+  ) -> list[concurrent.futures.Future]:
+    """Start compiling ``estimate``'s jitted programs on ``_COMPILE_POOL``.
+
+    Lowers against the same abstract values ``estimate`` later passes, so the
+    compiled executables land in the jit cache and are reused.
+    """
+    abstract_state = jax.eval_shape(
+        functools.partial(
+            self._init, domain, warm_start=warm_start, constraints=constraints
+        ),
+        loss_fn,
+        known_total,
+    )
+    abstract_constraints = jax.eval_shape(lambda x: x, constraints)
+    step = self._step_program().lower(
+        self, abstract_state, loss_fn, known_total, abstract_constraints
+    )
+    futures = [_COMPILE_POOL.submit(step.compile)]
+    if tol is not None:
+      abstract_mu = jax.eval_shape(
+          lambda st: self._callback_value(st, known_total, constraints),
+          abstract_state,
+      )
+      if isinstance(abstract_mu, CliqueVector):
+        gap = _jitted_primal_dual_gap.lower(
+            loss_fn, abstract_mu, self.marginal_oracle, abstract_constraints
+        )
+        futures.append(_COMPILE_POOL.submit(gap.compile))
+    return futures
+
+  def _multi_step_impl(self, state, loss_fn, known_total, constraints=()):
     """Run ``CALLBACK_EVERY`` optimization steps as a fused scan."""
 
     def step(s, _):
       return self._step(s, loss_fn, known_total, constraints), None
 
     return jax.lax.scan(step, state, None, length=CALLBACK_EVERY)[0]
+
+  def _single_step_impl(self, state, loss_fn, known_total, constraints=()):
+    """Run one optimization step (used when ``fuse_steps=False``)."""
+    return self._step(state, loss_fn, known_total, constraints)
+
+  _multi_step = jax.jit(
+      _multi_step_impl, static_argnames=["self"], donate_argnames=["state"]
+  )
+
+  def _step_program(self):
+    """The jitted program ``estimate`` runs, per ``fuse_steps``/``fast_compile``."""
+    return _jitted_step_program(
+        type(self)._multi_step_impl
+        if self.fuse_steps
+        else type(self)._single_step_impl,
+        self.fast_compile,
+        type(self)._multi_step if self.fuse_steps else None,
+    )
+
+  def _run_block(self, state, loss_fn, known_total, constraints=()):
+    """Advance the optimization by ``CALLBACK_EVERY`` steps."""
+    program = self._step_program()
+    if self.fuse_steps:
+      return program(self, state, loss_fn, known_total, constraints)
+    for _ in range(CALLBACK_EVERY):
+      state = program(self, state, loss_fn, known_total, constraints)
+    return state
 
   def precompile(
       self,
@@ -285,11 +386,33 @@ class Estimator(ABC):
         constraints=constraints,
     )
     abstract_constraints = jax.eval_shape(lambda x: x, constraints)
-    lowered = self._multi_step.lower(
+    lowered = self._step_program().lower(
         self, abstract_state, loss_fn, 1.0, abstract_constraints
     )
 
     return RobustFuture(_COMPILE_POOL.submit(lowered.compile))
+
+
+# XLA option that skips backend (LLVM) optimization passes.
+_FAST_COMPILE_OPTIONS = {"xla_backend_optimization_level": 0}
+
+
+@functools.cache
+def _jitted_step_program(impl, fast_compile, default_program=None):
+  """Return a cached jitted version of an estimator step implementation.
+
+  ``default_program`` is the class's existing jitted ``_multi_step``; it is
+  reused for the default configuration so that the jit cache (and code that
+  inspects ``Estimator._multi_step``) is shared with earlier versions.
+  """
+  if default_program is not None and not fast_compile:
+    return default_program
+  return jax.jit(
+      impl,
+      static_argnames=["self"],
+      donate_argnames=["state"],
+      compiler_options=_FAST_COMPILE_OPTIONS if fast_compile else None,
+  )
 
 
 def minimum_variance_unbiased_total(

@@ -16,6 +16,7 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, "results")
+IMPL = sys.argv[2] if len(sys.argv) > 2 else "reference"  # or "optimized"
 os.makedirs(OUT, exist_ok=True)
 
 STOP_AFTER = 600  # 10 minutes
@@ -28,13 +29,14 @@ LADDERS = {
                        20_000_000)],
     # vary columns; 10k rows, 16 bins
     "cols": [dict(rows=10_000, cols=c, bins=16)
-             for c in (4, 6, 8, 12, 16, 24, 32)],
+             for c in (4, 6, 8, 12, 16, 20, 24, 32)],
     # vary per-column domain size; 10k rows, 8 columns
-    "bins": [dict(rows=10_000, cols=8, bins=b) for b in (4, 16, 32, 64, 128)],
+    "bins": [dict(rows=10_000, cols=8, bins=b)
+             for b in (4, 16, 32, 64, 128, 256)],
     # grow everything together
     "combined": [dict(rows=r, cols=c, bins=b) for r, c, b in (
         (5_000, 5, 8), (20_000, 8, 16), (100_000, 12, 16),
-        (500_000, 16, 32), (2_000_000, 24, 32))],
+        (500_000, 16, 32), (2_000_000, 20, 32), (5_000_000, 24, 32))],
 }
 
 lock = threading.Lock()
@@ -52,7 +54,8 @@ def run_ladder(core, ladder, configs):
     cmd = ["taskset", "-c", str(core), sys.executable,
            os.path.join(HERE, "run_aim_experiment.py"),
            "--rows", str(cfg["rows"]), "--cols", str(cfg["cols"]),
-           "--bins", str(cfg["bins"]), "--name", name, "--out", out]
+           "--bins", str(cfg["bins"]), "--name", name, "--out", out,
+           "--impl", IMPL]
     t0 = time.time()
     with lock:
       print(f"[core {core}] START {name}", flush=True)
