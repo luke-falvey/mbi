@@ -11,6 +11,13 @@ This page documents the history of changes for each version of `mbi`.
     * `MarkovRandomField.synthetic_data` groups parent configurations with integer keys instead of `np.unique(..., axis=0)`, which was the bottleneck for large row counts. Output is bit-for-bit identical for the same seed.
     * `mechanisms/aim.py` scores candidates with NumPy, merges repeated measurements of the same clique, uses the options above, caches junction-tree sizes, and clears JAX caches when the process nears its memory-map limit (long runs previously crashed with "LLVM compilation error: Cannot allocate memory"). It also gains an opt-in `intermediate_iters` setting.
 
+* Optional native (Rust) backend, `mbi.native` (build with `python -m mbi.native build`; see `native/README.md`). It removes JIT compilation from the estimation loop entirely: the model structure is passed to the Rust kernels as data. When the library is unavailable everything falls back to JAX.
+    * `NativeMirrorDescent`: drop-in `MirrorDescent` running the whole optimization in float64 native code. It falls back to JAX for constraints, callbacks, non-identity queries and custom oracles.
+    * `out_of_model_marginals`: all pairwise marginals from one calibrated junction tree (one sweep per source attribute) instead of a variable elimination per pair.
+    * `hypothetical_model_sizes`, `expand`, `junction_tree_beliefs`, and `MarkovRandomField.synthetic_data(use_native=True)`.
+    * AIM uses all of these automatically when the library is available.
+* `junction_tree.greedy_order` and `junction_tree.hypothetical_model_size` are 7–9x faster with identical results (cached elimination costs; clique sizes computed directly from the elimination instead of building a networkx junction tree).
+
 ## Version 2.0.0 - 09/2026
 
 * New unified Estimator API & optimizers. MBI introduced an Estimator class replacing legacy ad-hoc estimation functions. Optimizers including MirrorDescent, DualAveraging, InteriorGradient, and LBFGS now share a common estimation lifecycle and benefit from shared components and a unified API. Key features include:

@@ -7,6 +7,7 @@ implementation; these tests check each building block for equivalence and
 that a full run selects the same cliques and fits the same model.
 """
 
+import dataclasses
 import itertools
 import os
 import sys
@@ -27,6 +28,7 @@ from mbi import (
     estimation,
     marginal_loss,
     marginal_oracles,
+    native,
 )
 from mbi.marginal_loss import SlicedQuery
 
@@ -227,13 +229,24 @@ class TestFilterCandidates(unittest.TestCase):
         )
 
 
-def _run(cls, data, workload, seed=0, **kwargs):
-  selected = []
+def _run(cls, data, workload, seed=0, forced=None, **kwargs):
+  """Run an AIM implementation, recording each round's selection and scores.
+
+  If ``forced`` (a list of cliques) is given, round ``t`` selects
+  ``forced[t]`` instead of the sampled clique. The exponential mechanism is
+  still evaluated, so the random stream (and hence all noise draws) stays
+  aligned with an unforced run that made the same choices.
+  """
+  selected, scores, epsilons = [], [], []
 
   class Recording(cls):
 
-    def worst_approximated(self, *args, **kw):
-      cl = super().worst_approximated(*args, **kw)
+    def exponential_mechanism(self, qualities, eps, *args, **kw):
+      cl = super().exponential_mechanism(qualities, eps, *args, **kw)
+      scores.append(dict(qualities))
+      epsilons.append(float(eps))
+      if forced is not None and len(selected) < len(forced):
+        cl = forced[len(selected)]
       selected.append(cl)
       return cl
 
@@ -242,37 +255,104 @@ def _run(cls, data, workload, seed=0, **kwargs):
       1.0, 1e-9, prng=np.random.RandomState(seed), max_iters=200, **kwargs
   )
   model, synth = mech.run(data, workload)
-  return selected, model, synth
+  return _Run(selected, scores, epsilons, model, synth)
 
 
-class TestAIMEndToEnd(unittest.TestCase):
-  """The optimized AIM must make the same choices as the original."""
+@dataclasses.dataclass
+class _Run:
+  selected: list
+  scores: list
+  epsilons: list
+  model: object
+  synth: object
+
+
+class _ReplayTest(unittest.TestCase):
+  """Base: replays the reference AIM's selections through the optimized one.
+
+  AIM is chaotic with respect to tiny numerical differences: a rounding-level
+  change in one candidate score can flip a draw of the exponential mechanism,
+  after which the runs diverge. So instead of requiring a free-running
+  optimized AIM to make identical random choices, the optimized AIM is forced
+  to select the reference's clique each round, and everything deterministic
+  is compared: the candidate set and scores each round, the number of rounds
+  (budget accounting / sigma halving), and the final model.
+
+  Tolerances: AIM's intermediate fits stop early (gap tolerance 1e-3), so any
+  change in the optimizer's path moves where they stop. As a baseline, the
+  *original* AIM run on a mathematically identical problem (the same noisy
+  measurements, passed to the estimator in reverse order) gives per-round
+  scores that differ by up to ~1e-2 of the model total. The optimized AIM
+  (which merges repeated measurements, an exactly equivalent objective) must
+  stay within that same band.
+  """
+
+  x64 = False
+  score_atol = 2e-2  # per unit of model total
+  model_atol = 5e-3
 
   @classmethod
   def setUpClass(cls):
+    cls.prev_x64 = bool(jax.config.jax_enable_x64)  # pylint: disable=no-member
+    if cls.x64 != cls.prev_x64:
+      jax.config.update("jax_enable_x64", cls.x64)
+      jax.clear_caches()
     cls.data = _dataset(rows=3000, seed=7)
     cls.workload = [
         (cl, 1.0) for cl in itertools.combinations(cls.data.domain, 2)
     ]
     cls.reference = _run(_reference_aim.ReferenceAIM, cls.data, cls.workload)
 
-  def _check(self, result):
-    ref_selected, ref_model, ref_synth = self.reference
-    selected, model, synth = result
-    self.assertEqual(selected, ref_selected)
-    self.assertEqual(set(model.cliques), set(ref_model.cliques))
-    self.assertAlmostEqual(
-        float(model.total), float(ref_model.total), delta=1e-3
+  @classmethod
+  def tearDownClass(cls):
+    if cls.x64 != cls.prev_x64:
+      jax.config.update("jax_enable_x64", cls.prev_x64)
+      jax.clear_caches()
+
+  def _check(self, **kwargs):
+    ref = self.reference
+    run = _run(
+        aim.AIM, self.data, self.workload, forced=ref.selected, **kwargs
     )
-    total = float(ref_model.total)
+    total = float(ref.model.total)
+    # Each round, AIM halves its noise scale if the fitted model barely moved
+    # (``||w - z||_1 <= sqrt(2/pi) sigma n``). When that statistic lands
+    # within rounding of its threshold, implementations can legitimately
+    # decide differently, after which the runs measure with different noise
+    # scales and are no longer comparable. Rounds are compared up to the
+    # first such split (visible as a different epsilon).
+    split = next(
+        (t for t, (a, b) in enumerate(zip(run.epsilons, ref.epsilons))
+         if abs(a - b) > 1e-9 * abs(b)),
+        None,
+    )
+    compared = len(ref.scores) if split is None else split
+    self.assertGreaterEqual(compared, 1)
+    for t in range(compared):
+      got, want = run.scores[t], ref.scores[t]
+      self.assertEqual(list(got), list(want), f"candidates, round {t}")
+      for cl in want:
+        self.assertAlmostEqual(
+            got[cl], want[cl], delta=self.score_atol * total,
+            msg=f"score of {cl}, round {t}",
+        )
+    self.assertEqual(run.synth.domain, ref.synth.domain)
+    if split is not None:
+      return
+    self.assertEqual(run.synth.records, ref.synth.records)
+    self.assertEqual(run.selected, ref.selected)  # same number of rounds
+    self.assertEqual(set(run.model.cliques), set(ref.model.cliques))
+    self.assertAlmostEqual(float(run.model.total), total, delta=1e-3 * total)
     for cl, _ in self.workload:
       np.testing.assert_allclose(
-          np.asarray(model.project(cl).datavector()) / total,
-          np.asarray(ref_model.project(cl).datavector()) / total,
-          atol=1e-3, err_msg=str(cl),
+          np.asarray(run.model.project(cl).datavector()) / total,
+          np.asarray(ref.model.project(cl).datavector()) / total,
+          atol=self.model_atol, err_msg=str(cl),
       )
-    self.assertEqual(synth.records, ref_synth.records)
-    self.assertEqual(synth.domain, ref_synth.domain)
+
+
+class TestAIMEndToEnd(_ReplayTest):
+  """JAX code path, float32 like the reference."""
 
   @parameterized.expand([
       ("defaults", {}),
@@ -286,7 +366,24 @@ class TestAIMEndToEnd(unittest.TestCase):
   ])
   def test_matches_reference(self, name, kwargs):
     del name
-    self._check(_run(aim.AIM, self.data, self.workload, **kwargs))
+    self._check(use_native=False, **kwargs)
+
+
+class TestAIMEndToEndFloat64(_ReplayTest):
+  """Both code paths (JAX and native) in float64."""
+
+  x64 = True
+
+  def test_jax_path(self):
+    self._check(use_native=False)
+
+  @unittest.skipUnless(native.is_available(), "mbi native library not built")
+  def test_native_path(self):
+    self._check(use_native=True)
+
+  @unittest.skipUnless(native.is_available(), "mbi native library not built")
+  def test_native_path_intermediate_iters_equal_max_iters(self):
+    self._check(use_native=True, intermediate_iters=200)
 
 
 class TestMemoryMapUsage(unittest.TestCase):
@@ -324,12 +421,10 @@ class TestAIMIntermediateIters(unittest.TestCase):
   def test_fewer_intermediate_iters_runs(self):
     data = _dataset(rows=1000, seed=8)
     workload = [(cl, 1.0) for cl in itertools.combinations(data.domain, 2)]
-    selected, model, synth = _run(
-        aim.AIM, data, workload, intermediate_iters=50
-    )
-    self.assertGreater(len(selected), 0)
-    self.assertEqual(synth.records, int(model.total))
-    self.assertEqual(synth.domain, data.domain)
+    run = _run(aim.AIM, data, workload, intermediate_iters=50)
+    self.assertGreater(len(run.selected), 0)
+    self.assertEqual(run.synth.records, int(run.model.total))
+    self.assertEqual(run.synth.domain, data.domain)
 
 
 if __name__ == "__main__":

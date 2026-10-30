@@ -7,7 +7,9 @@ finding maximal cliques, determining message passing orders, graph triangulation
 computing greedy elimination orders, and estimating model size.
 """
 
+import collections
 import itertools
+import math
 from collections import OrderedDict
 from collections.abc import Collection, Sequence
 from typing import cast
@@ -73,36 +75,66 @@ def greedy_order(
     stochastic: bool = False,
     elim: list[Attribute] | None = None,
 ) -> tuple[list[Attribute], int]:
-  """Compute a greedy elimination order."""
+  """Compute a greedy elimination order.
+
+  At each step, eliminates the attribute whose elimination creates the
+  smallest factor (ties broken by position in ``elim`` / the domain), merging
+  every clique that contains it. Costs are cached and only recomputed for the
+  attributes adjacent to the one just eliminated, since no other attribute's
+  neighborhood changes.
+  """
   order = []
-  unmarked = elim if elim is not None else list(domain.attributes)
-  clique_set = set(cliques)
+  unmarked = list(elim) if elim is not None else list(domain.attributes)
+  # Cliques may mention attributes outside ``domain`` (e.g. variable
+  # elimination's query clique); like the original, their sizes are only
+  # looked up if actually needed.
+  size = domain.config
+  # Attribute -> set of (ids of) current cliques containing it.
+  cliques_by_id: dict[int, frozenset] = {}
+  containing: dict = collections.defaultdict(set)
+  next_id = itertools.count()
+  for cl in dict.fromkeys(frozenset(c) for c in cliques):
+    k = next(next_id)
+    cliques_by_id[k] = cl
+    for v in cl:
+      containing[v].add(k)
+
+  def cost_of(a) -> int:
+    variables = set()
+    for k in containing[a]:
+      variables |= cliques_by_id[k]
+    return math.prod(size[v] for v in variables)
+
+  cost = {a: cost_of(a) for a in unmarked}
   total_cost = 0
   for _ in range(len(unmarked)):
-    cost = OrderedDict()
-    for a in unmarked:
-      neighbors = [cl for cl in clique_set if a in cl]
-      variables = tuple(set.union(set(), *[set(n) for n in neighbors]))
-      newdom = domain.project(variables)
-      cost[a] = newdom.size()
-
     if stochastic:
-      choices = list(unmarked)
-      costs = np.array([cost[a] for a in choices], dtype=float)
+      costs = np.array([cost[a] for a in unmarked], dtype=float)
       probas = np.max(costs) - costs + 1
       probas /= probas.sum()
-      i = np.random.choice(probas.size, p=probas)
-      a = choices[i]
+      a = unmarked[np.random.choice(probas.size, p=probas)]
     else:
-      a = min(cost, key=lambda a: cost[a])
+      a = min(unmarked, key=cost.__getitem__)
 
     order.append(a)
     unmarked.remove(a)
-    neighbors = [cl for cl in clique_set if a in cl]
-    variables = tuple(set.union(set(), *[set(n) for n in neighbors]) - {a})
-    clique_set -= set(neighbors)
-    clique_set.add(variables)
     total_cost += cost[a]
+    neighbors = containing[a].copy()
+    variables = set()
+    for k in neighbors:
+      variables |= cliques_by_id[k]
+    variables.discard(a)
+    for k in neighbors:
+      for v in cliques_by_id.pop(k):
+        containing[v].discard(k)
+    merged = frozenset(variables)
+    k = next(next_id)
+    cliques_by_id[k] = merged
+    for v in merged:
+      containing[v].add(k)
+    for v in merged:
+      if v in cost:
+        cost[v] = cost_of(v)
 
   return order, total_cost
 
@@ -148,9 +180,56 @@ def make_junction_tree(
 
 
 def hypothetical_model_size(domain: Domain, cliques: Sequence[Clique]) -> float:
-  """Size of the full junction tree parameters, measured in megabytes."""
-  jtree, _ = make_junction_tree(domain, cliques)
-  max_cliques = maximal_cliques(jtree)
-  cells = sum(domain.size(cl) for cl in max_cliques)
-  size_mb = cells * 8 / 2**20
-  return size_mb
+  """Size of the full junction tree parameters, measured in megabytes.
+
+  Equal to summing the maximal-clique sizes of ``make_junction_tree(domain,
+  cliques)``, but computed directly from the elimination: under a perfect
+  elimination order the maximal cliques of the triangulated graph are the
+  maximal sets among ``{v} | neighbors(v)`` at the time ``v`` is eliminated,
+  so no graph objects, clique enumeration or spanning tree are needed. This
+  is called for every candidate clique in every round of AIM.
+  """
+  cliques = [tuple(cl) for cl in cliques]
+  attrs = list(domain.attributes)
+  adjacency = {a: set() for a in attrs}
+  n_edges = 0
+  for cl in cliques:
+    for u, v in itertools.combinations(cl, 2):
+      if v not in adjacency[u]:
+        adjacency[u].add(v)
+        adjacency[v].add(u)
+        n_edges += 1
+  # make_junction_tree uses a DFS post-order (no fill-in) when the graph is a
+  # tree; otherwise the greedy order.
+  if n_edges > 0 and n_edges == len(attrs) - 1 and _is_connected(adjacency):
+    # A tree triangulates without fill-in: its maximal cliques are its edges.
+    maximal = list({frozenset((u, v)) for u in attrs for v in adjacency[u]})
+  else:
+    order = greedy_order(domain, cliques, stochastic=False)[0]
+    adj = {a: set(n) for a, n in adjacency.items()}
+    elim_cliques = []
+    for v in order:
+      nbrs = adj.pop(v)
+      elim_cliques.append(frozenset(nbrs | {v}))
+      for u in nbrs:
+        adj[u].discard(v)
+        adj[u] |= nbrs - {u}
+    elim_cliques = list(dict.fromkeys(elim_cliques))
+    maximal = [
+        c for c in elim_cliques if not any(c < other for other in elim_cliques)
+    ]
+  cells = sum(math.prod(domain[a] for a in c) for c in maximal)
+  return cells * 8 / 2**20
+
+
+def _is_connected(adjacency) -> bool:
+  if not adjacency:
+    return True
+  start = next(iter(adjacency))
+  seen, stack = {start}, [start]
+  while stack:
+    for u in adjacency[stack.pop()]:
+      if u not in seen:
+        seen.add(u)
+        stack.append(u)
+  return len(seen) == len(adjacency)

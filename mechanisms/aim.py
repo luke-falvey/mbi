@@ -35,6 +35,7 @@ from mbi import (
     marginal_oracles,
     LinearMeasurement,
 )
+from mbi import native
 from mbi.marginal_loss import DatavectorQuery
 from mechanism import Mechanism
 from collections import defaultdict
@@ -78,24 +79,38 @@ def filter_candidates(candidates, model, size_limit, size_cache=None):
 
     ``size_cache`` (optional dict) memoizes junction-tree sizes across calls;
     AIM often revisits the same model structure (e.g. when it re-measures a
-    clique), so the same sizes get recomputed otherwise.
+    clique), so the same sizes get recomputed otherwise.  When the native
+    library is available, the sizes of all remaining candidates are computed
+    in one native call.
     """
-    ans = {}
     free_cliques = set(downward_closure(model.cliques))
     model_cliques = tuple(model.cliques)
-    for cl in candidates:
-        key = (model_cliques, cl)
-        if size_cache is not None and key in size_cache:
-            size = size_cache[key]
-        else:
-            size = junction_tree.hypothetical_model_size(
-                model.domain, list(model_cliques) + [cl]
+    if size_cache is None:
+        size_cache = {}
+    # Candidates already supported by the model are kept regardless of size,
+    # so their (expensive) junction-tree sizes are never needed.
+    todo = [
+        cl
+        for cl in candidates
+        if cl not in free_cliques and (model_cliques, cl) not in size_cache
+    ]
+    if todo:
+        if native.is_available():
+            sizes = native.hypothetical_model_sizes(
+                model.domain, list(model_cliques), todo
             )
-            if size_cache is not None:
-                size_cache[key] = size
-        cond1 = size <= size_limit
-        cond2 = cl in free_cliques
-        if cond1 or cond2:
+        else:
+            sizes = [
+                junction_tree.hypothetical_model_size(
+                    model.domain, list(model_cliques) + [cl]
+                )
+                for cl in todo
+            ]
+        for cl, size in zip(todo, sizes):
+            size_cache[(model_cliques, cl)] = size
+    ans = {}
+    for cl in candidates:
+        if cl in free_cliques or size_cache[(model_cliques, cl)] <= size_limit:
             ans[cl] = candidates[cl]
     return ans
 
@@ -170,8 +185,31 @@ class _NumpyMarginals:
     def __init__(self, model):
         self.model = model
         self.tables = {}
+        self.out_of_model = {}
+
+    def prefetch(self, cliques):
+        """Compute the out-of-model marginals among ``cliques`` in one batch.
+
+        Uses ``mbi.native.out_of_model_marginals`` (one calibrated junction
+        tree, one sweep per source attribute) instead of a separate variable
+        elimination per clique.
+        """
+        todo = [
+            cl
+            for cl in cliques
+            if cl not in self.out_of_model
+            and not self.model.marginals.supports(cl)
+        ]
+        if todo:
+            self.out_of_model.update(
+                native.out_of_model_marginals(
+                    self.model.potentials, float(self.model.total), todo
+                )
+            )
 
     def datavector(self, cl):
+        if cl in self.out_of_model:
+            return self.out_of_model[cl]
         model = self.model
         if model.marginals.supports(cl):
             parent = model.marginals.parent(cl)
@@ -210,6 +248,7 @@ class AIM(Mechanism):
         clear_caches_map_fraction=0.5,
         parallel_compile=None,
         intermediate_iters=None,
+        use_native=None,
     ):
         """
         :param fuse_steps: passed to ``MirrorDescent``.  ``False`` (default)
@@ -232,6 +271,11 @@ class AIM(Mechanism):
             and are warm-started from the previous round, so a smaller value
             trades a little selection accuracy for speed.  Defaults to
             ``max_iters`` (no change in behaviour).
+        :param use_native: fit models with ``mbi.native.NativeMirrorDescent``
+            (the optimization loop in Rust, no JIT compilation).  Defaults to
+            ``True`` when the native library is available (build it with
+            ``python -m mbi.native build``); otherwise the JAX
+            ``MirrorDescent`` is used with the options above.
         """
         super(AIM, self).__init__(
             epsilon, delta, bounded=False, prng=prng or np.random
@@ -252,12 +296,20 @@ class AIM(Mechanism):
             parallel_compile = ncpu > 1
         self.parallel_compile = parallel_compile
         self.intermediate_iters = intermediate_iters or max_iters
+        if use_native is None:
+            use_native = native.is_available()
+        self.use_native = use_native
 
     def _estimate(self, domain, measurements, warm_start=None, iters=None):
         cliques = list({m.clique for m in measurements})
         jtree, _ = junction_tree.make_junction_tree(domain, cliques)
         cells = sum(domain.size(cl) for cl in junction_tree.maximal_cliques(jtree))
-        estimator = estimation.MirrorDescent(
+        cls = (
+            native.NativeMirrorDescent
+            if self.use_native
+            else estimation.MirrorDescent
+        )
+        estimator = cls(
             fuse_steps=self.fuse_steps,
             fast_compile=cells <= self.fast_compile_max_cells,
             parallel_compile=self.parallel_compile,
@@ -273,6 +325,8 @@ class AIM(Mechanism):
         errors = {}
         sensitivity = {}
         marginals = _NumpyMarginals(model)
+        if self.use_native:
+            marginals.prefetch(list(candidates))
         for cl in candidates:
             wgt = candidates[cl]
             x = answers[cl]
@@ -353,7 +407,10 @@ class AIM(Mechanism):
             # Warm start potentials from prior round
             # TODO: check if it helps to call maximal_subsets here
             pcliques = list(set(M.clique for M in measurements))
-            potentials = model.potentials.expand(pcliques)
+            if self.use_native:
+                potentials = native.expand(model.potentials, pcliques)
+            else:
+                potentials = model.potentials.expand(pcliques)
             model = self._estimate(
                 data.domain,
                 measurements,
@@ -371,7 +428,9 @@ class AIM(Mechanism):
         model = self._estimate(
             data.domain, measurements, warm_start=potentials
         )
-        synth = model.synthetic_data(rows=num_synth_rows)
+        synth = model.synthetic_data(
+            rows=num_synth_rows, use_native=self.use_native
+        )
 
         return model, synth
 

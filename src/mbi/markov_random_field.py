@@ -98,7 +98,10 @@ class MarkovRandomField:
     return self.marginals.domain.supports(attrs)
 
   def synthetic_data(
-      self, rows: int | None = None, method: str = "round"
+      self,
+      rows: int | None = None,
+      method: str = "round",
+      use_native: bool = False,
   ) -> Dataset:
     """Generates synthetic data based on the learned model's marginals.
 
@@ -108,6 +111,13 @@ class MarkovRandomField:
         method: Specification for strategy to use to generate records.
                 - "round" for randomized rounding
                 - "sample" for i.i.d sampling
+        use_native: Compute the junction-tree marginals with the native
+                library (``mbi.native``) in float64 instead of JAX, which
+                avoids compiling a message-passing program for this model.
+                Ignored if the library is unavailable or the model has
+                constraints. The generated data is statistically equivalent
+                but, because marginals can differ in the last bits, need not
+                be identical to the default for the same seed.
 
     Returns:
         A synthetic dataset whose marginals should closely match those of the
@@ -125,13 +135,21 @@ class MarkovRandomField:
     # the full dependency structure of the model.
     cliques = [set(cl) for cl in jtree.nodes]
 
-    potentials = self.potentials.expand(list(jtree.nodes))
-    if self.constraints:
+    from . import native  # pylint: disable=import-outside-toplevel
+
+    if use_native and not self.constraints and native.is_available():
+      potentials = native.expand(self.potentials, list(jtree.nodes))
+      marginals = native.NumpyMarginals.from_potentials(
+          potentials, float(self.total)
+      )
+    elif self.constraints:
+      potentials = self.potentials.expand(list(jtree.nodes))
       # Shafer-Shenoy handles the -inf constraint potentials that HUGIN can't.
       marginals = marginal_oracles.message_passing_shafer_shenoy(
           potentials, self.total, constraints=self.constraints
       )
     else:
+      potentials = self.potentials.expand(list(jtree.nodes))
       marginals = marginal_oracles.message_passing_stable(
           potentials, self.total
       )

@@ -15,3 +15,7 @@ __pycache__/
 
 # Stray test output
 test_out.txt
+
+# Native (Rust) build output
+native/target/
+src/mbi/_native/
