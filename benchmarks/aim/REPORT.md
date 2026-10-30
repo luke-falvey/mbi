@@ -478,7 +478,14 @@ tables.
   Further levers are the opt-in `AIM(intermediate_iters=...)`, a GPU via the
   JAX path, or further kernel work.
 
-<!-- MULTICORE -->
+**With 4 cores** (no pinning, native threads enabled), 1M rows × 8 columns
+**completes in 28.5 minutes** (1,709s, 47 rounds, average TV error 0.0027).
+That's 99% fitting compute and 0.1s of compilation. No earlier version
+completed this configuration: the original JAX code was at round 33 when it
+hit the 25-minute cap. Threads give only about 1.5× on these late-round fits,
+because many of their tables are below the 1M-cell parallel threshold. A
+persistent thread pool (next steps) would let smaller tables and independent
+messages run in parallel. Results: `results_native_4core/`.
 
 ### Correctness
 
@@ -506,8 +513,8 @@ tables.
   final model is checked too. One more effect: occasionally AIM's σ-halving
   statistic lands within rounding of its threshold (one case measured
   291.3/291.9 against a threshold of 291.6), after which runs legitimately
-  diverge. The test compares up to that point. These tests pass on 32
-  different hash seeds.
+  diverge. The test compares up to that point. These tests pass on 44
+  different hash seeds, including 12 on the final kernel build.
 * **Precision note:** with the native backend, AIM's fits run in float64,
   while the original uses JAX's default float32. In float32, the reference
   fit stops early on a float32 convergence check and is accurate to roughly

@@ -1,0 +1,98 @@
+Initial Sigma 68.91495605703464
+Budget Used 0.0009592115072142645 / 0.014973057673588523
+Measuring Clique ('cont_4', 'inte_5')
+Budget Used 0.0010761885202891749 / 0.014973057673588523
+Measuring Clique ('bool_3', 'cont_4')
+Budget Used 0.0011931655333640853 / 0.014973057673588523
+Measuring Clique ('cont_0', 'inte_1')
+Budget Used 0.0013101425464389956 / 0.014973057673588523
+Measuring Clique ('inte_5', 'bool_7')
+Budget Used 0.001427119559513906 / 0.014973057673588523
+Measuring Clique ('inte_1', 'bool_3')
+Budget Used 0.0015440965725888164 / 0.014973057673588523
+Measuring Clique ('inte_5', 'cate_6')
+Budget Used 0.0016610735856637268 / 0.014973057673588523
+Measuring Clique ('cate_2', 'bool_3')
+Budget Used 0.0017780505987386372 / 0.014973057673588523
+Measuring Clique ('inte_1', 'bool_7')
+Budget Used 0.0018950276118135476 / 0.014973057673588523
+Measuring Clique ('inte_1', 'cate_2')
+Budget Used 0.0020120046248884578 / 0.014973057673588523
+Measuring Clique ('inte_1', 'cont_4')
+Budget Used 0.002128981637963368 / 0.014973057673588523
+Measuring Clique ('cate_6', 'bool_7')
+Budget Used 0.0022459586510382786 / 0.014973057673588523
+Measuring Clique ('bool_3', 'bool_7')
+Budget Used 0.002362935664113189 / 0.014973057673588523
+Measuring Clique ('cont_0', 'inte_5')
+Budget Used 0.0024799126771880993 / 0.014973057673588523
+Measuring Clique ('cate_2', 'inte_5')
+Budget Used 0.0025968896902630097 / 0.014973057673588523
+Measuring Clique ('bool_3', 'cate_6')
+Budget Used 0.00271386670333792 / 0.014973057673588523
+Measuring Clique ('cont_4', 'bool_7')
+Budget Used 0.0028308437164128305 / 0.014973057673588523
+Measuring Clique ('inte_1', 'cate_6')
+Budget Used 0.002947820729487741 / 0.014973057673588523
+Measuring Clique ('cate_2', 'bool_7')
+Budget Used 0.0030647977425626513 / 0.014973057673588523
+Measuring Clique ('bool_3', 'inte_5')
+Budget Used 0.0031817747556375617 / 0.014973057673588523
+Measuring Clique ('cont_0', 'bool_7')
+Budget Used 0.003298751768712472 / 0.014973057673588523
+Measuring Clique ('cate_2', 'cont_4')
+Budget Used 0.0034157287817873825 / 0.014973057673588523
+Measuring Clique ('inte_1', 'inte_5')
+Budget Used 0.003532705794862293 / 0.014973057673588523
+Measuring Clique ('cont_0', 'bool_3')
+Budget Used 0.0036496828079372033 / 0.014973057673588523
+Measuring Clique ('cont_4', 'cate_6')
+Budget Used 0.0037666598210121137 / 0.014973057673588523
+Measuring Clique ('cont_0', 'cont_4')
+Budget Used 0.003883636834087024 / 0.014973057673588523
+Measuring Clique ('cont_0',)
+(!!!!!!!!!!!!!!!!!!!!!!) Reducing sigma 34.45747802851732
+Budget Used 0.004351544886386665 / 0.014973057673588523
+Measuring Clique ('inte_1', 'cate_2')
+Budget Used 0.004819452938686307 / 0.014973057673588523
+Measuring Clique ('cont_4', 'cate_6')
+Budget Used 0.005287360990985948 / 0.014973057673588523
+Measuring Clique ('cont_0', 'inte_1')
+Budget Used 0.00575526904328559 / 0.014973057673588523
+Measuring Clique ('cate_2', 'cont_4')
+Budget Used 0.0062231770955852314 / 0.014973057673588523
+Measuring Clique ('cate_2', 'inte_5')
+Budget Used 0.006691085147884873 / 0.014973057673588523
+Measuring Clique ('cont_4', 'inte_5')
+Budget Used 0.007158993200184515 / 0.014973057673588523
+Measuring Clique ('cate_2', 'cate_6')
+Budget Used 0.007626901252484156 / 0.014973057673588523
+Measuring Clique ('cont_0', 'cont_4')
+Budget Used 0.008094809304783797 / 0.014973057673588523
+Measuring Clique ('cont_0', 'inte_5')
+Budget Used 0.008562717357083438 / 0.014973057673588523
+Measuring Clique ('inte_5', 'cate_6')
+Budget Used 0.00903062540938308 / 0.014973057673588523
+Measuring Clique ('inte_1', 'inte_5')
+Budget Used 0.009498533461682722 / 0.014973057673588523
+Measuring Clique ('inte_1', 'cate_6')
+Budget Used 0.009966441513982363 / 0.014973057673588523
+Measuring Clique ('inte_1', 'cont_4')
+Budget Used 0.010434349566282005 / 0.014973057673588523
+Measuring Clique ('cate_6', 'bool_7')
+Budget Used 0.010902257618581646 / 0.014973057673588523
+Measuring Clique ('inte_1', 'bool_3')
+Budget Used 0.011370165670881288 / 0.014973057673588523
+Measuring Clique ('cont_0', 'bool_7')
+Budget Used 0.01183807372318093 / 0.014973057673588523
+Measuring Clique ('bool_3', 'inte_5')
+Budget Used 0.012305981775480571 / 0.014973057673588523
+Measuring Clique ('cont_0', 'cate_2')
+Budget Used 0.012773889827780213 / 0.014973057673588523
+Measuring Clique ('cont_4', 'bool_7')
+Budget Used 0.013241797880079854 / 0.014973057673588523
+Measuring Clique ('inte_5',)
+(!!!!!!!!!!!!!!!!!!!!!!) Reducing sigma 17.22873901425866
+Budget Used 0.014973057673588523 / 0.014973057673588523
+Measuring Clique ('inte_1', 'cont_4')
+Generating Data...

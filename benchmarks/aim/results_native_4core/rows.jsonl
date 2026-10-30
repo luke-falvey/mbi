@@ -1,0 +1,49 @@
+{"name": "rows:r1000000_c8_b16", "event": "start", "rows": 1000000, "cols": 8, "bins": 16, "epsilon": 1.0, "max_model_size": 80, "max_iters": 1000, "seed": 0, "out": "results_native_4core/rows.jsonl", "impl": "optimized", "jax": "0.12.0.1", "threads_env": ""}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 1, "selected": ["cont_4", "inte_5"], "t_elapsed": 0.6098041599998396}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 2, "selected": ["bool_3", "cont_4"], "t_elapsed": 0.7236088770005153}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 3, "selected": ["cont_0", "inte_1"], "t_elapsed": 0.81987018899963}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 4, "selected": ["inte_5", "bool_7"], "t_elapsed": 0.8461586350003927}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 5, "selected": ["inte_1", "bool_3"], "t_elapsed": 0.8739135110008647}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 6, "selected": ["inte_5", "cate_6"], "t_elapsed": 0.9050685029997112}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 7, "selected": ["cate_2", "bool_3"], "t_elapsed": 0.9430754749992047}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 8, "selected": ["inte_1", "bool_7"], "t_elapsed": 0.9986033370005316}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 9, "selected": ["inte_1", "cate_2"], "t_elapsed": 1.0615267680004763}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 10, "selected": ["inte_1", "cont_4"], "t_elapsed": 1.1055055689994333}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 11, "selected": ["cate_6", "bool_7"], "t_elapsed": 1.1655322539991175}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 12, "selected": ["bool_3", "bool_7"], "t_elapsed": 1.2420631850000063}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 13, "selected": ["cont_0", "inte_5"], "t_elapsed": 1.3575479350001842}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 14, "selected": ["cate_2", "inte_5"], "t_elapsed": 1.5986218679990998}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 15, "selected": ["bool_3", "cate_6"], "t_elapsed": 1.983893877999435}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 16, "selected": ["cont_4", "bool_7"], "t_elapsed": 2.3247318049998285}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 17, "selected": ["inte_1", "cate_6"], "t_elapsed": 2.86054860799959}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 18, "selected": ["cate_2", "bool_7"], "t_elapsed": 3.622450034999929}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 19, "selected": ["bool_3", "inte_5"], "t_elapsed": 4.5351202549991285}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 20, "selected": ["cont_0", "bool_7"], "t_elapsed": 5.516174995000256}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 21, "selected": ["cate_2", "cont_4"], "t_elapsed": 6.493385384999783}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 22, "selected": ["inte_1", "inte_5"], "t_elapsed": 11.397595381000428}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 23, "selected": ["cont_0", "bool_3"], "t_elapsed": 16.351653327999884}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 24, "selected": ["cont_4", "cate_6"], "t_elapsed": 21.681716844999755}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 25, "selected": ["cont_0", "cont_4"], "t_elapsed": 33.95450365800025}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 26, "selected": ["cont_0"], "t_elapsed": 52.70636932600064}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 27, "selected": ["inte_1", "cate_2"], "t_elapsed": 71.46192561200041}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 28, "selected": ["cont_4", "cate_6"], "t_elapsed": 89.91378985799929}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 29, "selected": ["cont_0", "inte_1"], "t_elapsed": 108.53498230600053}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 30, "selected": ["cate_2", "cont_4"], "t_elapsed": 127.22739900399938}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 31, "selected": ["cate_2", "inte_5"], "t_elapsed": 146.17367161400034}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 32, "selected": ["cont_4", "inte_5"], "t_elapsed": 166.0359986450003}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 33, "selected": ["cate_2", "cate_6"], "t_elapsed": 186.0849118089991}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 34, "selected": ["cont_0", "cont_4"], "t_elapsed": 256.7194165059991}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 35, "selected": ["cont_0", "inte_5"], "t_elapsed": 322.54652777000047}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 36, "selected": ["inte_5", "cate_6"], "t_elapsed": 386.0779067399999}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 37, "selected": ["inte_1", "inte_5"], "t_elapsed": 449.3833062699996}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 38, "selected": ["inte_1", "cate_6"], "t_elapsed": 515.3210479680001}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 39, "selected": ["inte_1", "cont_4"], "t_elapsed": 580.7545963400007}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 40, "selected": ["cate_6", "bool_7"], "t_elapsed": 648.6606918849993}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 41, "selected": ["inte_1", "bool_3"], "t_elapsed": 716.8261464099996}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 42, "selected": ["cont_0", "bool_7"], "t_elapsed": 784.8626461019994}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 43, "selected": ["bool_3", "inte_5"], "t_elapsed": 853.8391487869994}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 44, "selected": ["cont_0", "cate_2"], "t_elapsed": 927.5347814369998}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 45, "selected": ["cont_4", "bool_7"], "t_elapsed": 1087.6169456539992}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 46, "selected": ["inte_5"], "t_elapsed": 1241.2938818260009}
+{"name": "rows:r1000000_c8_b16", "event": "round", "round": 47, "selected": ["inte_1", "cont_4"], "t_elapsed": 1394.8028334720002}
+{"name": "rows:r1000000_c8_b16", "event": "done", "domain": {"cont_0": 16, "inte_1": 16, "cate_2": 16, "bool_3": 2, "cont_4": 16, "inte_5": 16, "cate_6": 16, "bool_7": 2}, "rounds": 47, "t_wall": 1709.0288938070007, "t_make_raw": 3.759898880000037, "t_discretize": 0.4168186879996938, "t_aim_total": 1704.418667965001, "t_compile_total": 0.4094557762145996, "n_compiles": 24, "phases": {"fit": 1689.0385889360023, "fit/jit_compile": 0.13657450675964355, "select/worst_approximated": 10.415247739001643, "select/jit_compile": 0.0, "generate/synthetic_data": 3.428652343000067}, "phase_calls": {"fit": 49, "fit/jit_compile": 49, "select/worst_approximated": 47, "select/jit_compile": 47, "generate/synthetic_data": 1}, "avg_tv_error": 0.0027172863483428955}
