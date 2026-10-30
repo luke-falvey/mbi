@@ -1,0 +1,32 @@
+=== combined:r100000_c12_b16
+E1030 09:54:42.687229    1223 execution_engine.cc:58] LLVM compilation error: Cannot allocate memory
+E1030 09:54:42.752614    1223 execution_engine.cc:58] LLVM compilation error: Cannot allocate memory
+E1030 09:54:42.785023    1223 execution_engine.cc:58] LLVM compilation error: Cannot allocate memory
+E1030 09:54:42.812294    1223 execution_engine.cc:58] LLVM compilation error: Cannot allocate memory
+E1030 09:54:42.830411    1223 execution_engine.cc:58] LLVM compilation error: Cannot allocate memory
+E1030 09:54:42.870386    1223 execution_engine.cc:58] LLVM compilation error: Cannot allocate memory
+E1030 09:54:42.892196    1223 execution_engine.cc:58] LLVM compilation error: Cannot allocate memory
+E1030 09:54:42.911333    1223 execution_engine.cc:58] LLVM compilation error: Cannot allocate memory
+Traceback (most recent call last):
+  File "/home/user/mbi/benchmarks/aim/run_aim_experiment.py", line 349, in <module>
+    main()
+    ~~~~^^
+  File "/home/user/mbi/benchmarks/aim/run_aim_experiment.py", line 322, in main
+    model, synth = mech.run(data, workload, num_synth_rows=args.rows)
+                   ~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/mbi/benchmarks/aim/run_aim_experiment.py", line 226, in run
+    cl = self.worst_approximated(small, answers, model, epsilon, sigma)
+  File "/home/user/mbi/benchmarks/aim/run_aim_experiment.py", line 156, in worst_approximated
+    xest = np.asarray(model.project(cl).datavector())
+                      ~~~~~~~~~~~~~^^^^
+  File "/home/user/mbi/src/mbi/markov_random_field.py", line 59, in project
+    return marginal_oracles.variable_elimination(
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        self.potentials, attrs, float(self.total)  # pyrefly: ignore[bad-argument-type]
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+jax.errors.JaxRuntimeError: INTERNAL: Failed to materialize symbols: { (<xla_jit_dylib_19>, { select_reduce_fusion.4 }) }
+--------------------
+For simplicity, JAX has removed its internal frames from the traceback of the following exception. Set JAX_TRACEBACK_FILTERING=off to include these.
+

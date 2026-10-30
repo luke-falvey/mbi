@@ -1,0 +1,140 @@
+{
+ "config": {
+  "rows": 10000,
+  "cols": 8,
+  "bins": 16,
+  "out": "results/profile_c8.json"
+ },
+ "process_memory_maps": 21965,
+ "t_aim_total": 415.0410124949999,
+ "rounds": 23,
+ "compile_total": 395.7577621936798,
+ "n_compiles": 649,
+ "phases": {
+  "setup/answer_all_candidates": 0.15436490299998695,
+  "fit/initial": 6.403384596999786,
+  "fit/initial/jit_compile": 6.208406209945679,
+  "select/filter_candidates(jtree size)": 0.40365013400105454,
+  "select/project_in_model": 0.03832633700085353,
+  "select/project_out_of_model(VE)": 177.29068148000124,
+  "select/worst_approximated": 177.39165058599838,
+  "select/jit_compile": 175.80354499816895,
+  "measure": 0.12760736400196038,
+  "fit/round": 224.97167106000052,
+  "fit/round/jit_compile": 210.74376964569092,
+  "fit/final": 2.4358763309996903,
+  "fit/final/jit_compile": 0.0,
+  "generate/synthetic_data": 2.668865120999726
+ },
+ "top_compiles": [
+  [
+   "jit(_multi_step)",
+   24,
+   173.39
+  ],
+  [
+   "jit(variable_elimination)",
+   315,
+   163.13
+  ],
+  [
+   "jit(message_passing_hugin)",
+   33,
+   34.12
+  ],
+  [
+   "jit(_reduce_sum)",
+   32,
+   0.92
+  ],
+  [
+   "jit(_moveaxis)",
+   44,
+   0.75
+  ],
+  [
+   "jit(broadcast_in_dim)",
+   27,
+   0.74
+  ],
+  [
+   "jit(add)",
+   28,
+   0.69
+  ],
+  [
+   "jit(true_divide)",
+   16,
+   0.59
+  ],
+  [
+   "jit(vdot)",
+   15,
+   0.48
+  ],
+  [
+   "jit(_reduce_max)",
+   15,
+   0.42
+  ],
+  [
+   "jit(multiply)",
+   16,
+   0.41
+  ],
+  [
+   "jit(subtract)",
+   15,
+   0.29
+  ],
+  [
+   "jit(reshape)",
+   11,
+   0.25
+  ],
+  [
+   "jit(stack)",
+   9,
+   0.25
+  ],
+  [
+   "jit(not_equal)",
+   6,
+   0.17
+  ],
+  [
+   "jit(bitwise_and)",
+   6,
+   0.16
+  ],
+  [
+   "jit(ravel)",
+   18,
+   0.13
+  ],
+  [
+   "jit(copy)",
+   7,
+   0.05
+  ],
+  [
+   "jit(stage)",
+   7,
+   0.05
+  ],
+  [
+   "jit(maximum)",
+   1,
+   0.02
+  ]
+ ],
+ "final_fit_first_s": 2.6335683519996564,
+ "final_fit_first_compile_s": 0.0,
+ "final_fit_cached_s": 2.37991206300012,
+ "final_fit_cached_compile_s": 0.0,
+ "n_measurements": 31,
+ "n_supported_candidates": 23,
+ "project_jax_first_s": 0.0013169230001039978,
+ "project_jax_cached_s": 0.0008990669998638623,
+ "project_numpy_s": 0.0003187709999110666
+}
