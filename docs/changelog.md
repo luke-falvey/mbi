@@ -5,7 +5,7 @@ This page documents the history of changes for each version of `mbi`.
 ## Unreleased
 
 * Faster AIM and estimation when compile time dominates (see `benchmarks/aim/REPORT.md`). None of these change results beyond floating-point rounding:
-    * New opt-in `Estimator` options: `fuse_steps=False` compiles a single optimization step instead of a fused `lax.scan` (~5x faster to compile on CPU), `fast_compile=True` disables XLA backend optimizations for small models, and `parallel_compile=True` compiles the step and convergence-check programs on background threads.
+    * New opt-in `Estimator` options: `fuse_steps=False` compiles a single optimization step instead of a fused `lax.scan` (~5x faster to compile on CPU), `fast_compile=True` disables XLA backend optimizations for small models (step, init/finalize oracle and convergence check), and `parallel_compile=True` compiles the step and convergence-check programs on background threads.
     * The convergence check (`primal_dual_gap`) in `Estimator.estimate` is now one jitted program instead of an op-by-op gradient plus a separately compiled oracle call.
     * New `marginal_oracles.variable_elimination_numpy`, a NumPy (no-JIT) equivalent of `variable_elimination` for querying many out-of-model marginals.
     * `MarkovRandomField.synthetic_data` groups parent configurations with integer keys instead of `np.unique(..., axis=0)`, which was the bottleneck for large row counts. Output is bit-for-bit identical for the same seed.

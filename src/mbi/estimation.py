@@ -101,6 +101,26 @@ def primal_dual_gap(
 _jitted_primal_dual_gap = jax.jit(
     primal_dual_gap, static_argnames=("marginal_oracle", "normalize")
 )
+# XLA option that skips backend (LLVM) optimization passes.
+_FAST_COMPILE_OPTIONS = {"xla_backend_optimization_level": 0}
+_jitted_primal_dual_gap_fast = jax.jit(
+    primal_dual_gap,
+    static_argnames=("marginal_oracle", "normalize"),
+    compiler_options=_FAST_COMPILE_OPTIONS,
+)
+
+
+def _call_oracle(oracle, potentials, total, constraints):
+  return oracle(potentials, total, constraints=constraints)
+
+
+# Oracle calls made once per fit (initialization / finalization), compiled
+# without backend optimizations when ``fast_compile`` is set.
+_fast_compile_oracle = jax.jit(
+    _call_oracle,
+    static_argnames=("oracle",),
+    compiler_options=_FAST_COMPILE_OPTIONS,
+)
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -126,10 +146,12 @@ class Estimator(ABC):
           compilation is ~5x faster at the cost of a small per-step dispatch
           overhead. Prefer ``False`` when many differently-structured models
           are each fit once (e.g. inside AIM), where compile time dominates.
-      fast_compile: If ``True``, compile the optimization step with XLA's
-          backend optimizations disabled. Compilation is ~3-4x faster but each
-          step runs ~2-3x slower, so this only pays off for small models where
-          compile time dominates. Defaults to ``False``.
+      fast_compile: If ``True``, compile the optimization step (and, for
+          ``MirrorDescent``, the one-off initialization/finalization oracle
+          calls and the convergence check) with XLA's backend optimizations
+          disabled. Compilation is ~1.5-2.5x faster but each step runs ~2-3x
+          slower, so this only pays off for small models where compile time
+          dominates. Defaults to ``False``.
       parallel_compile: If ``True``, ``estimate`` compiles the optimization
           step and the convergence check on background threads while the
           estimator initializes, so the independent XLA compilations run
@@ -201,6 +223,34 @@ class Estimator(ABC):
         cliques, domain, has_constraints=bool(constraints)
     )
     return functools.partial(oracle, constraints=constraints)
+
+  def _setup_oracle(self, cliques, domain, constraints=()):
+    """Oracle for one-off calls outside the step program (init / finalize).
+
+    With ``fast_compile`` the call is compiled without backend optimizations,
+    like the step program; otherwise this is the same as ``_oracle``.
+    """
+    if not self.fast_compile:
+      return self._oracle(cliques, domain, constraints=constraints)
+    oracle = self.marginal_oracle or marginal_oracles.default_oracle(
+        cliques, domain, has_constraints=bool(constraints)
+    )
+    constraints = tuple(constraints)
+
+    def call(potentials, total):
+      # compiler_options are only allowed on top-level jits, so when this is
+      # traced (e.g. by precompile's eval_shape) call the oracle directly.
+      if any(isinstance(x, jax.core.Tracer) for x in jax.tree.leaves(potentials)):
+        return oracle(potentials, total, constraints=constraints)
+      return _fast_compile_oracle(oracle, potentials, total, constraints)
+
+    return call
+
+  def _gap_program(self):
+    """The jitted convergence check, honoring ``fast_compile``."""
+    if self.fast_compile:
+      return _jitted_primal_dual_gap_fast
+    return _jitted_primal_dual_gap
 
   # ------------------------------------------------------------------
   # Default implementations
@@ -279,7 +329,7 @@ class Estimator(ABC):
       if tol is not None:
         if not isinstance(mu, CliqueVector):
           mu = CliqueVector.from_projectable(mu, loss_fn.cliques)
-        gap = _jitted_primal_dual_gap(
+        gap = self._gap_program()(
             loss_fn, mu, self.marginal_oracle, constraints
         )
         if gap <= tol or gap == prev_gap:
@@ -313,7 +363,7 @@ class Estimator(ABC):
           abstract_state,
       )
       if isinstance(abstract_mu, CliqueVector):
-        gap = _jitted_primal_dual_gap.lower(
+        gap = self._gap_program().lower(
             loss_fn, abstract_mu, self.marginal_oracle, abstract_constraints
         )
         futures.append(_COMPILE_POOL.submit(gap.compile))
@@ -391,10 +441,6 @@ class Estimator(ABC):
     )
 
     return RobustFuture(_COMPILE_POOL.submit(lowered.compile))
-
-
-# XLA option that skips backend (LLVM) optimization passes.
-_FAST_COMPILE_OPTIONS = {"xla_backend_optimization_level": 0}
 
 
 @functools.cache
@@ -569,7 +615,7 @@ class MirrorDescent(Estimator):
   ) -> MirrorDescentState:
     """Initialize the optimization state."""
     potentials = _extract_potentials(warm_start, domain, loss_fn.cliques)
-    marginal_oracle = self._oracle(
+    marginal_oracle = self._setup_oracle(
         loss_fn.cliques, domain, constraints=constraints
     )
     # Theory suggests the initial learning rate should be inversely
@@ -621,7 +667,7 @@ class MirrorDescent(Estimator):
       known_total: float,
       constraints=(),
   ) -> MarkovRandomField:
-    marginal_oracle = self._oracle(
+    marginal_oracle = self._setup_oracle(
         state.potentials.cliques,
         state.potentials.domain,
         constraints=constraints,
@@ -862,7 +908,7 @@ class LBFGS(Estimator):
     return marginal_oracle(state.potentials, known_total)
 
   def _finalize(self, state, known_total, constraints=()):
-    marginal_oracle = self._oracle(
+    marginal_oracle = self._setup_oracle(
         state.potentials.cliques,
         state.potentials.domain,
         constraints=constraints,
