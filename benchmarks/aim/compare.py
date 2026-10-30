@@ -1,9 +1,18 @@
-"""Before/after table: results/ (original AIM) vs results_optimized/."""
+"""Before/after tables across benchmark result folders.
+
+Usage: python compare.py [results results_optimized results_native]
+"""
 import json, os, sys
 HERE = os.path.dirname(os.path.abspath(__file__))
+dirs = sys.argv[1:] or ["results", "results_optimized", "results_native"]
+labels = {"results": "original", "results_optimized": "phases 1-2 (JAX)",
+          "results_native": "native (Rust)"}
 
 def load(d):
   runs = {}
+  d = os.path.join(HERE, d)
+  if not os.path.isdir(d):
+    return runs
   for f in sorted(os.listdir(d)):
     if not f.endswith(".jsonl"): continue
     for l in open(os.path.join(d, f)):
@@ -14,26 +23,27 @@ def load(d):
   return runs
 
 def cell(run):
-  if run is None: return "–", None, None
+  if run is None: return "–", None
   ex, done = run.get("exit", {}), run.get("done")
   if done:
-    t = done["t_wall"]; n = done["rounds"]
-    return f"{t:.0f}s ({n} rounds)", t, t / max(n, 1)
+    t = done["t_wall"]
+    return (f"{t:.1f}s" if t < 10 else f"{t:.0f}s") + f" ({done['rounds']} rds)", t
   st = ex.get("status", "?")
   label = {"timeout": "timeout", "error 1": "crashed"}.get(st, st)
-  el = ex.get("elapsed", 0)
-  per = el / run["rounds"] if run["rounds"] and el else None
-  return f"{label} at {el:.0f}s ({run['rounds']} rounds)", None, per
+  return f"{label} at {ex.get('elapsed', 0):.0f}s ({run['rounds']} rds)", None
 
-before, after = load(os.path.join(HERE, "results")), load(os.path.join(HERE, "results_optimized"))
+data = [load(d) for d in dirs]
+names = set().union(*data)
 order = lambda n: (n.split(":")[0], [int(x[1:]) for x in n.split(":")[1].split("_")])
-print("| run (rows / cols / bins) | original | optimized | speedup (total) | speedup (per round) |")
-print("|---|---|---|---|---|")
-for name in sorted(set(before) | set(after), key=order):
+hdr = ["run (rows / cols / bins)"] + [labels.get(d, d) for d in dirs]
+if len(dirs) > 1: hdr.append(f"speedup {labels.get(dirs[-1], dirs[-1])} vs {labels.get(dirs[0], dirs[0])}")
+print("| " + " | ".join(hdr) + " |"); print("|" + "---|" * len(hdr))
+for name in sorted(names, key=order):
   if name.startswith("multicore"): continue
-  b, tb, pb = cell(before.get(name)); a, ta, pa = cell(after.get(name))
-  sp = f"{tb/ta:.1f}×" if tb and ta else ("runs to completion" if ta and not tb and name in before else "–")
-  spr = f"{pb/pa:.1f}×" if pb and pa else "–"
-  ladder, cfg = name.split(":")
-  r, c, bi = (x[1:] for x in cfg.split("_"))
-  print(f"| {ladder}: {int(r):,} / {c} / {bi} | {b} | {a} | {sp} | {spr} |")
+  ladder, cfg = name.split(":"); r, c, b = (x[1:] for x in cfg.split("_"))
+  cells = [cell(d.get(name)) for d in data]
+  row = [f"{ladder}: {int(r):,} / {c} / {b}"] + [x[0] for x in cells]
+  if len(dirs) > 1:
+    a, z = cells[0][1], cells[-1][1]
+    row.append(f"{a / z:.0f}×" if a and z else ("completes" if z and name in data[0] else "–"))
+  print("| " + " | ".join(row) + " |")

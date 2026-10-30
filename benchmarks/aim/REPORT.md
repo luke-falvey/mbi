@@ -2,7 +2,13 @@
 
 ## TL;DR
 
-> **Update: Phases 1 and 2 are implemented** (see [section 5](#5-results-after-implementing-phases-1-and-2)).
+> **Update 2: native (Rust) backend** (see [section 6](#6-native-rust-backend)).
+> With the optional Rust library, AIM runs **70–500× faster than the
+> original** on every configuration benchmarked, single core. The 8-column run
+> goes from 411s to about 1s, and 24–32 columns finish in about 10s. JIT
+> compilation is gone from the fitting loop entirely.
+>
+> **Update 1: Phases 1 and 2 are implemented** (see [section 5](#5-results-after-implementing-phases-1-and-2)).
 > AIM is now **5–7× faster end to end** on every configuration that
 > finished before. Runs with 12–24 columns that used to crash now complete.
 > Generating 10M synthetic rows takes 17s instead of 79s with bit-identical
@@ -353,16 +359,197 @@ float32 precision, and the faster `synthetic_data`, which is bit-identical.
   configurations select **the same cliques** as the original and fit the
   same model to within 1e-3 of the total.
 
+## 6. Native (Rust) backend
+
+After Phases 1–2, about 80% of AIM's remaining time was still compilation.
+JAX compiles a new XLA program (~2.5s) for every new model structure,
+because the junction tree is baked into the program, and AIM produces a new
+structure most rounds. No amount of Python-side tuning removes that. So,
+following section 4, the fitting loop was rewritten in Rust with the model
+structure passed in as **data**.
+
+### What was built
+
+`native/` is a dependency-free Rust `cdylib` with a C interface, loaded by
+`src/mbi/native.py` with `ctypes`. It is optional: build it with
+`python -m mbi.native build`. When it is missing, everything falls back to
+the JAX code paths.
+
+| Piece | What it does |
+|---|---|
+| `NativeMirrorDescent` | Drop-in `MirrorDescent`. The whole `estimate` loop (HUGIN message passing, L2 loss, Armijo line search, primal-dual-gap early stopping) runs in one native call, in float64. It reuses each line-search trial's marginals as the next step's marginals, so it does half the message passing for the same result. It falls back to JAX for constraints, callbacks, non-identity queries and custom oracles. |
+| `out_of_model_marginals` | Candidate scoring. Calibrates the junction tree once, then one sweep per source attribute `a` carries `P(a, ·)` across the tree. Every pair is read off from those sweeps, instead of one variable elimination per pair. |
+| `hypothetical_model_sizes` | AIM's size filter, computed for all candidates in one native call (bitset graphs, the same greedy elimination, 128-bit sizes with an exact Python fallback on overflow). |
+| `expand`, `junction_tree_beliefs`, `synthetic_data(use_native=True)` | NumPy/native replacements for the remaining eager JAX operations in AIM's loop, plus the compile of message passing for the final model. |
+
+Library-level Python improvements found along the way (exact, and used
+with or without the native library):
+
+* `junction_tree.greedy_order` caches elimination costs and recomputes only
+  the neighbours of the eliminated attribute: **6.8× faster**, with identical
+  output on 1,200 random cases.
+* `junction_tree.hypothetical_model_size` reads clique sizes directly off the
+  elimination (no networkx graph, clique search or spanning tree): **9×
+  faster**, identical on 1,500 random cases.
+* `filter_candidates` skips the size computation for candidates the model
+  already covers, since those are kept regardless of size.
+
+### Kernel engineering, and what each step bought
+
+The first straightforward version was *slower* than XLA on large models (54
+against 12 ns/cell). In order of impact, the fixes were:
+
+1. **Block-structured index maps.** Every projection or broadcast between a
+   table and a subset of its attributes has trailing axes that are either all
+   kept (a contiguous element-wise loop) or all reduced (a contiguous block
+   reduction). Iterating by block removes the serial dependency chains of
+   per-element scatters. One message-passing call on a 328k-cell model went
+   from 14.6 to 3.4 ms.
+2. **Small-block fallback.** A trailing boolean attribute makes blocks of 2,
+   where per-block overhead dominates. Maps with blocks under 16 cells use
+   plain gather/scatter loops instead. 925k-cell model: 42 → 27 ms.
+3. **Size-ordered internal layouts.** Junction-tree tables (internal to the
+   native code) store attributes from smallest to largest domain, so trailing
+   runs are long. 27 → 21 ms.
+4. **Convert to probabilities once.** Each junction-tree table is
+   exponentiated once, and every loss-clique marginal is a plain sum over it,
+   instead of a log-sum-exp projection per marginal. 56 → 40 ms (with 2–3 not
+   yet applied).
+5. **Cache-blocked fused passes.** Potential expansion, marginal read-out and
+   the loss/gradient process each large table once, in 4,096-cell chunks,
+   applying every map that touches it.
+6. **Vectorized `exp`** (Cody-Waite plus a degree-13 polynomial, using FMA
+   when the build targets it).
+7. **Deterministic threads** for tables over 1M cells. The partition is
+   fixed, so results don't depend on the thread count. This gave ~1.9× on 4
+   cores for 4M-cell models.
+
+Final micro-benchmarks (single core unless noted; "cold" includes all
+compilation):
+
+| Model | JAX `MirrorDescent` (original, fused) | Native |
+|---|---|---|
+| AIM's 8-column model (2k junction-tree cells), full fit | 15.3s cold / 0.27s warm | **0.08s cold / 0.03s warm** |
+| 4-way chain, 328k cells, full fit (1,000 iters) | 10.0s cold / 7.3s warm | **5.8s** |
+| 12 attributes, 925k cells, one message-passing call | 37.8 ms | **19.4 ms** |
+| 5-way chain, 4M cells, 200 iters | 31.4s (1 core) / 12.2s (4 cores) | **30.9s** (1 core) / 16.3s (4 cores) |
+
+Native is faster everywhere on one core and never compiles. The only case
+where JAX is still ahead is very large models on several cores (12.2s
+against 16.3s at 4M cells), where XLA's fused multi-threaded kernels win.
+
+### End-to-end results (same ladders, one core per experiment)
+
+| run (rows / cols / bins) | original | phases 1-2 (JAX) | native (Rust) | speedup native (Rust) vs original |
+|---|---|---|---|---|
+| bins: 10,000 / 8 / 4 | 586s (27 rds) | 91s (22 rds) | 1.1s (29 rds) | 516× |
+| bins: 10,000 / 8 / 16 | 435s (25 rds) | 74s (23 rds) | 1.1s (25 rds) | 395× |
+| bins: 10,000 / 8 / 32 | 353s (20 rds) | 57s (20 rds) | 1.1s (21 rds) | 324× |
+| bins: 10,000 / 8 / 64 | 448s (15 rds) | 63s (14 rds) | 1.7s (15 rds) | 268× |
+| bins: 10,000 / 8 / 128 | 318s (14 rds) | 54s (14 rds) | 1.6s (14 rds) | 195× |
+| bins: 10,000 / 8 / 256 | – | 37s (14 rds) | 1.6s (12 rds) | – |
+| cols: 10,000 / 4 / 16 | 36s (11 rds) | 9.9s (12 rds) | 0.5s (12 rds) | 67× |
+| cols: 10,000 / 6 / 16 | 115s (15 rds) | 22s (16 rds) | 0.7s (14 rds) | 171× |
+| cols: 10,000 / 8 / 16 | 411s (23 rds) | 64s (22 rds) | 1.0s (25 rds) | 418× |
+| cols: 10,000 / 12 / 16 | crashed at 938s (17 rds) | 194s (38 rds) | 1.6s (36 rds) | completes |
+| cols: 10,000 / 16 / 16 | – | 283s (37 rds) | 2.3s (41 rds) | – |
+| cols: 10,000 / 20 / 16 | – | 585s (56 rds) | 3.9s (57 rds) | – |
+| cols: 10,000 / 24 / 16 | – | 774s (59 rds) | 6.2s (70 rds) | – |
+| cols: 10,000 / 32 / 16 | – | – | 9.9s (80 rds) | – |
+| combined: 5,000 / 5 / 8 | 64s (12 rds) | 19s (10 rds) | 0.6s (12 rds) | 110× |
+| combined: 20,000 / 8 / 16 | 562s (29 rds) | 90s (28 rds) | 1.4s (28 rds) | 415× |
+| combined: 100,000 / 12 / 16 | crashed at 880s (14 rds) | 622s (55 rds) | 49s (66 rds) | completes |
+| combined: 500,000 / 16 / 32 | – | – | timeout at 1500s (90 rds) | – |
+| rows: 1,000 / 8 / 16 | 143s (9 rds) | 23s (9 rds) | 0.8s (10 rds) | 176× |
+| rows: 10,000 / 8 / 16 | 375s (22 rds) | 73s (23 rds) | 1.0s (22 rds) | 366× |
+| rows: 100,000 / 8 / 16 | 1095s (38 rds) | 164s (34 rds) | 6.9s (31 rds) | 158× |
+| rows: 1,000,000 / 8 / 16 | – | timeout at 1500s (33 rds) | timeout at 1500s (43 rds) | – |
+
+Times exclude Python start-up and imports (about 2s), as in the earlier
+tables.
+
+* **Every configuration that ran before is 67–516× faster.** 24 columns now
+  takes 6s, and 32 columns 10s.
+* **Two configurations still exceed 25 minutes on one core:** 1M rows × 8
+  columns and 500k rows × 16 columns. These are compute-bound. As the
+  privacy budget is spent, AIM's size limit grows toward 80 MB, and late
+  rounds fit multi-million-cell models for up to 1,000 iterations each (about
+  150s per round for 1M rows after round 35). With 4 cores, see below.
+  Further levers are the opt-in `AIM(intermediate_iters=...)`, a GPU via the
+  JAX path, or further kernel work.
+
+<!-- MULTICORE -->
+
+### Correctness
+
+* **Native routines match their JAX/Python counterparts in float64**
+  (`test/test_native.py`, 37 tests). Message passing agrees to 1e-10
+  relative. Fixed-step fits agree to 1e-9. Line-search fits agree to 1e-5:
+  the optimization is the same, but rounding can flip a near-tied
+  accept/reject or move the gap check across `tol`. Pairwise marginals from
+  the sweep match variable elimination to 1e-9. Model sizes match exactly.
+* **Synthetic data:** `use_native=True` is opt-in, because float64 marginals
+  can round a few counts differently from the default float32 path. In tests
+  the outputs were identical or within 1e-3 total variation.
+* **The rewritten junction-tree helpers** match verbatim copies of the
+  originals on thousands of random graphs
+  (`test/test_junction_tree_equivalence.py`).
+* **AIM end to end** (`test/test_aim.py`). AIM is chaotic with respect to
+  rounding: a tiny score change can flip one draw of the exponential
+  mechanism, and everything after diverges. Measuring this directly, the
+  *original* AIM run on a mathematically identical problem (same noisy
+  measurements, passed to the estimator in reverse order) shifts per-round
+  scores by up to 1e-2 of the model total. The end-to-end tests therefore
+  *replay* the original: the optimized AIM is forced to make the original's
+  choices while still consuming the random stream identically. Per-round
+  candidates and scores are checked against that measured band, and the
+  final model is checked too. One more effect: occasionally AIM's σ-halving
+  statistic lands within rounding of its threshold (one case measured
+  291.3/291.9 against a threshold of 291.6), after which runs legitimately
+  diverge. The test compares up to that point. These tests pass on 32
+  different hash seeds.
+* **Precision note:** with the native backend, AIM's fits run in float64,
+  while the original uses JAX's default float32. In float32, the reference
+  fit stops early on a float32 convergence check and is accurate to roughly
+  one count per thousand records, so runs with and without the native
+  library can make different random choices from the same seed. Both are
+  correct samples of the mechanism; the float64 one is more precise.
+* Full suite: 1,677 tests pass (1,559 original plus 118 new).
+
+### Answer to section 4, revisited
+
+The earlier recommendation was "fix compilation in Python first; Rust only
+for targeted kernels." Phases 1–2 got 5–7×. Moving the fitting loop to
+native code with the structure as data got a further 30–100×, because the
+remaining cost was structural to JAX's design for this workload (many
+differently-shaped small programs, each run once). For workloads that fit
+one large model many times, JAX/XLA, especially on GPU, remains the better
+engine, and the JAX paths are unchanged and still the default for
+`MirrorDescent`.
+
+### Next steps
+
+* Ship prebuilt wheels (maturin or cibuildwheel), so users don't need a Rust
+  toolchain.
+* Large-model throughput on multi-core machines: a persistent thread pool
+  (to parallelize smaller tables and independent messages), and fewer passes
+  per message.
+* Port more estimators (e.g. `UniversalAcceleratedMethod`) and Shafer-Shenoy
+  (for constraints) to the native path.
+
+
 ## Reproducing
 
 ```bash
 pip install -e . matplotlib
+python -m mbi.native build     # optional: Rust backend (needs cargo)
 cd benchmarks/aim
 python run_ladders.py results                       # original AIM, ~1 hour on 4 cores
 python run_ladders.py results_optimized optimized   # optimized AIM
 python summarize.py results
 python compare.py                                   # before/after table
 python profile_breakdown.py --cols 8 --out results/profile_c8.json
+python run_ladders.py results_native optimized      # with the native library built
 python gen_scaling.py results_optimized/gen_scaling.json
 python -m pytest test/test_aim.py test/test_synthetic_data_equivalence.py \
   test/test_estimation_compile_options.py test/test_variable_elimination_numpy.py

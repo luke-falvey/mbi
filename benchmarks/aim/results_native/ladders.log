@@ -1,0 +1,45 @@
+[core 0] START rows:r1000_c8_b16
+[core 3] START combined:r5000_c5_b8
+[core 2] START bins:r10000_c8_b4
+[core 1] START cols:r10000_c4_b16
+[core 1] END   cols:r10000_c4_b16 ok 3s
+[core 1] START cols:r10000_c6_b16
+[core 3] END   combined:r5000_c5_b8 ok 3s
+[core 3] START combined:r20000_c8_b16
+[core 0] END   rows:r1000_c8_b16 ok 3s
+[core 0] START rows:r10000_c8_b16
+[core 2] END   bins:r10000_c8_b4 ok 3s
+[core 2] START bins:r10000_c8_b16
+[core 1] END   cols:r10000_c6_b16 ok 3s
+[core 1] START cols:r10000_c8_b16
+[core 0] END   rows:r10000_c8_b16 ok 3s
+[core 0] START rows:r100000_c8_b16
+[core 3] END   combined:r20000_c8_b16 ok 3s
+[core 3] START combined:r100000_c12_b16
+[core 2] END   bins:r10000_c8_b16 ok 3s
+[core 2] START bins:r10000_c8_b32
+[core 1] END   cols:r10000_c8_b16 ok 3s
+[core 1] START cols:r10000_c12_b16
+[core 2] END   bins:r10000_c8_b32 ok 3s
+[core 2] START bins:r10000_c8_b64
+[core 1] END   cols:r10000_c12_b16 ok 3s
+[core 1] START cols:r10000_c16_b16
+[core 2] END   bins:r10000_c8_b64 ok 4s
+[core 2] START bins:r10000_c8_b128
+[core 0] END   rows:r100000_c8_b16 ok 9s
+[core 0] START rows:r1000000_c8_b16
+[core 1] END   cols:r10000_c16_b16 ok 4s
+[core 1] START cols:r10000_c20_b16
+[core 2] END   bins:r10000_c8_b128 ok 4s
+[core 2] START bins:r10000_c8_b256
+[core 2] END   bins:r10000_c8_b256 ok 4s
+[core 1] END   cols:r10000_c20_b16 ok 6s
+[core 1] START cols:r10000_c24_b16
+[core 1] END   cols:r10000_c24_b16 ok 8s
+[core 1] START cols:r10000_c32_b16
+[core 1] END   cols:r10000_c32_b16 ok 12s
+[core 3] END   combined:r100000_c12_b16 ok 51s
+[core 3] START combined:r500000_c16_b32
+[core 0] END   rows:r1000000_c8_b16 timeout 1500s
+[core 3] END   combined:r500000_c16_b32 timeout 1500s
+ALL DONE
