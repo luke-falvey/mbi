@@ -275,7 +275,6 @@ impl<'a> Map<'a> {
 struct Plan<'a> {
     l_off: &'a [u64],
     j_off: &'a [u64],
-    exp_parent: &'a [u32],
     exp_maps: Vec<Map<'a>>,
     e_src: &'a [u32],
     e_dst: &'a [u32],
@@ -291,6 +290,12 @@ struct Plan<'a> {
     y: &'a [f64],
     m_inv_sd: Vec<f64>,
     m_maps: Vec<Map<'a>>,
+    /// Loss cliques expanded into each junction-tree clique.
+    exp_groups: Vec<Vec<usize>>,
+    /// Loss cliques whose marginal is read from each junction-tree clique.
+    mar_groups: Vec<Vec<usize>>,
+    /// Measurements read from each loss clique.
+    m_groups: Vec<Vec<usize>>,
 }
 
 unsafe fn maps<'a>(n: usize, off: *const u64, idx: *const u32, bk: *const u64) -> Vec<Map<'a>> {
@@ -300,6 +305,14 @@ unsafe fn maps<'a>(n: usize, off: *const u64, idx: *const u32, bk: *const u64) -
     (0..n).map(|i| Map::new(&idx[off[i] as usize..off[i + 1] as usize], bk[i])).collect()
 }
 
+fn groups(n: usize, parent: &[u32]) -> Vec<Vec<usize>> {
+    let mut g = vec![Vec::new(); n];
+    for (i, &p) in parent.iter().enumerate() {
+        g[p as usize].push(i);
+    }
+    g
+}
+
 impl<'a> Plan<'a> {
     unsafe fn new(p: &'a PlanC) -> Plan<'a> {
         let (n_l, n_j, n_e, n_m) = (p.n_l as usize, p.n_j as usize, p.n_e as usize, p.n_m as usize);
@@ -307,7 +320,6 @@ impl<'a> Plan<'a> {
         Plan {
             l_off: sl(p.l_off, n_l + 1),
             j_off: sl(p.j_off, n_j + 1),
-            exp_parent: sl(p.exp_parent, n_l),
             exp_maps: maps(n_l, p.exp_map_off, p.exp_map, p.exp_bk),
             e_src: sl(p.e_src, n_e),
             e_dst: sl(p.e_dst, n_e),
@@ -323,6 +335,9 @@ impl<'a> Plan<'a> {
             y: sl(p.y, m_off[n_m] as usize),
             m_inv_sd: sl(p.m_sd, n_m).iter().map(|&s| 1.0 / s.max(1e-12)).collect(),
             m_maps: maps(n_m, p.m_map_off, p.m_map, p.m_bk),
+            exp_groups: groups(n_j, sl(p.exp_parent, n_l)),
+            mar_groups: groups(n_j, sl(p.mar_parent, n_l)),
+            m_groups: groups(n_l, sl(p.m_l, n_m)),
         }
     }
 
@@ -352,10 +367,12 @@ enum Reduce {
 /// Scratch buffers reused across oracle calls.
 struct Work {
     beliefs: Vec<f64>,
+    probs: Vec<f64>,
+    /// Scratch for fused projections (several outputs at once).
+    mbuf: Vec<f64>,
     messages: Vec<f64>,
     sent: Vec<bool>,
     acc: Vec<f64>,
-    tmp: Vec<f64>,
 }
 
 impl Work {
@@ -369,10 +386,21 @@ impl Work {
             .unwrap_or(0);
         Work {
             beliefs: vec![0.0; *plan.j_off.last().unwrap() as usize],
+            probs: vec![0.0; *plan.j_off.last().unwrap() as usize],
+            mbuf: vec![
+                0.0;
+                plan.mar_groups
+                    .iter()
+                    .map(|g| g.iter().map(|&i| plan.l_range(i).len()).sum::<usize>())
+                    .chain(plan.m_groups.iter().map(|g| {
+                        g.iter().map(|&m| (plan.m_off[m + 1] - plan.m_off[m]) as usize).sum::<usize>()
+                    }))
+                    .max()
+                    .unwrap_or(0)
+            ],
             messages: vec![0.0; plan.sep_off[n_e] as usize],
             sent: vec![false; n_e],
             acc: vec![0.0; max_sep.max(max_l).max(max_m)],
-            tmp: vec![0.0; max_l.max(max_m)],
         }
     }
 }
@@ -434,6 +462,28 @@ fn sum_exp(xs: &[f64], c: f64, buf: &mut [f64; CHUNK]) -> f64 {
 #[inline(always)]
 fn scatter_max(v: &[f64], sub: Option<&[f64]>, m: Map, out: &mut [f64]) {
     let bsz = m.block;
+    if bsz < SMALL_BLOCK {
+        match sub {
+            None => {
+                for (k, &x) in v.iter().enumerate() {
+                    let o = m.idx[k] as usize;
+                    if x > out[o] {
+                        out[o] = x;
+                    }
+                }
+            }
+            Some(s) => {
+                for (k, &x) in v.iter().enumerate() {
+                    let o = m.idx[k] as usize;
+                    let t = x - s[o];
+                    if t > out[o] {
+                        out[o] = t;
+                    }
+                }
+            }
+        }
+        return;
+    }
     for start in (0..v.len()).step_by(bsz) {
         let blk = &v[start..start + bsz];
         let o = m.idx[start] as usize;
@@ -470,6 +520,30 @@ fn scatter_max(v: &[f64], sub: Option<&[f64]>, m: Map, out: &mut [f64]) {
 #[inline(always)]
 fn scatter_sum_exp(v: &[f64], sub: Option<&[f64]>, m: Map, mx: &[f64], acc: &mut [f64], buf: &mut [f64; CHUNK]) {
     let bsz = m.block;
+    if bsz < SMALL_BLOCK {
+        // gather -> vectorized exp -> scatter, chunk-wise.
+        let mut start = 0;
+        while start < v.len() {
+            let end = (start + CHUNK).min(v.len());
+            let b = &mut buf[..end - start];
+            let idx = &m.idx[start..end];
+            for (k, bk) in b.iter_mut().enumerate() {
+                let o = idx[k] as usize;
+                let c = mx[o];
+                let sv = match sub {
+                    None => 0.0,
+                    Some(s) => s[o],
+                };
+                *bk = if c == f64::NEG_INFINITY { f64::NEG_INFINITY } else { v[start + k] - sv - c };
+            }
+            exp_inplace(b);
+            for (k, &bk) in b.iter().enumerate() {
+                acc[idx[k] as usize] += bk;
+            }
+            start = end;
+        }
+        return;
+    }
     for start in (0..v.len()).step_by(bsz) {
         let blk = &v[start..start + bsz];
         let o = m.idx[start] as usize;
@@ -511,6 +585,12 @@ fn scatter_sum_exp(v: &[f64], sub: Option<&[f64]>, m: Map, mx: &[f64], acc: &mut
 #[inline(always)]
 fn broadcast_add(big: &mut [f64], m: Map, small: &[f64]) {
     let bsz = m.block;
+    if bsz < SMALL_BLOCK {
+        for (x, &o) in big.iter_mut().zip(m.idx) {
+            *x += small[o as usize];
+        }
+        return;
+    }
     for start in (0..big.len()).step_by(bsz) {
         let o = m.idx[start] as usize;
         let blk = &mut big[start..start + bsz];
@@ -527,20 +607,152 @@ fn broadcast_add(big: &mut [f64], m: Map, small: &[f64]) {
     }
 }
 
-/// `out[map[k]] += v[k]`; `out` must be pre-zeroed.
+/// Maps whose blocks are shorter than this use element-wise gather/scatter
+/// loops: per-block loop overhead would dominate, and dependency chains on
+/// repeated targets are at most this long.
+const SMALL_BLOCK: usize = 16;
+
+/// Cells per cache block in fused multi-map loops (fits in L1).
+const FUSE_CHUNK: usize = 4096;
+
+/// Visit the runs of `m` covering big cells `start..start + len`: calls
+/// `f(offset_in_range, run_len, small_index_of_first_cell)`. Works for any
+/// range, not just block-aligned ones: within a block, kept runs map to
+/// consecutive small cells and reduced runs map to a single small cell.
 #[inline(always)]
-fn scatter_sum(v: &[f64], m: Map, out: &mut [f64]) {
-    let bsz = m.block;
-    for start in (0..v.len()).step_by(bsz) {
-        let o = m.idx[start] as usize;
-        let blk = &v[start..start + bsz];
+fn for_segments(m: Map, start: usize, len: usize, mut f: impl FnMut(usize, usize, usize)) {
+    let b = m.block;
+    let end = start + len;
+    let mut p = start;
+    while p < end {
+        let seg = (b - p % b).min(end - p);
+        f(p - start, seg, m.idx[p] as usize);
+        p += seg;
+    }
+}
+
+/// `chunk[k] += small[map[start + k]]`.
+#[inline(always)]
+fn broadcast_add_seg(chunk: &mut [f64], start: usize, m: Map, small: &[f64]) {
+    if m.block < SMALL_BLOCK {
+        let n = chunk.len();
+        for (x, &o) in chunk.iter_mut().zip(&m.idx[start..start + n]) {
+            *x += small[o as usize];
+        }
+        return;
+    }
+    for_segments(m, start, chunk.len(), |off, seg, o| {
+        let c = &mut chunk[off..off + seg];
         if m.kept {
-            for (x, &y) in out[o..o + bsz].iter_mut().zip(blk) {
+            for (x, &y) in c.iter_mut().zip(&small[o..o + seg]) {
                 *x += y;
             }
         } else {
-            out[o] += vsum(blk);
+            let y = small[o];
+            for x in c.iter_mut() {
+                *x += y;
+            }
         }
+    });
+}
+
+/// `out[map[start + k]] += chunk[k]`.
+#[inline(always)]
+fn scatter_sum_seg(chunk: &[f64], start: usize, m: Map, out: &mut [f64]) {
+    if m.block < SMALL_BLOCK {
+        for (&x, &o) in chunk.iter().zip(&m.idx[start..start + chunk.len()]) {
+            out[o as usize] += x;
+        }
+        return;
+    }
+    for_segments(m, start, chunk.len(), |off, seg, o| {
+        let c = &chunk[off..off + seg];
+        if m.kept {
+            for (x, &y) in out[o..o + seg].iter_mut().zip(c) {
+                *x += y;
+            }
+        } else {
+            out[o] += vsum(c);
+        }
+    });
+}
+
+/// `big = sum_i broadcast(small_i)` for several maps into the same big table,
+/// in one cache-blocked pass (instead of one pass per map).
+#[inline(always)]
+fn fused_broadcast_set(big: &mut [f64], terms: &[(Map, &[f64])]) {
+    let ranges = split(big.len(), 1);
+    par_chunks_mut(big, &ranges, |part, r| {
+        let mut pos = r.start;
+        for chunk in part.chunks_mut(FUSE_CHUNK) {
+            chunk.fill(0.0);
+            for &(m, small) in terms {
+                broadcast_add_seg(chunk, pos, m, small);
+            }
+            pos += chunk.len();
+        }
+    });
+}
+
+/// `outs[t] = project_sum(v onto map t)` for several maps out of the same big
+/// table, in one cache-blocked pass. `outs` is a flat buffer split at `offs`.
+///
+/// Identity maps are plain (parallel) copies. The others are reduced in
+/// parallel into per-part partial outputs when those are small relative to
+/// the input (the usual case: projections onto fewer attributes); otherwise
+/// on one thread, to avoid allocating and combining large partial buffers.
+#[inline(always)]
+fn fused_scatter_sum(v: &[f64], maps: &[Map], offs: &[usize], outs: &mut [f64]) {
+    let total = *offs.last().unwrap();
+    let outs = &mut outs[..total];
+    let mut rest: Vec<usize> = Vec::new();
+    for (t, m) in maps.iter().enumerate() {
+        let out = &mut outs[offs[t]..offs[t + 1]];
+        if m.is_identity(out.len()) {
+            let ranges = split(v.len(), 1);
+            par_chunks_mut(out, &ranges, |c, r| c.copy_from_slice(&v[r]));
+        } else {
+            out.fill(0.0);
+            rest.push(t);
+        }
+    }
+    if rest.is_empty() {
+        return;
+    }
+    let rest_total: usize = rest.iter().map(|&t| offs[t + 1] - offs[t]).sum();
+    let run = |r: std::ops::Range<usize>, o: &mut [f64], local: bool| {
+        let mut pos = r.start;
+        for chunk in v[r].chunks(FUSE_CHUNK) {
+            let mut base = 0;
+            for &t in &rest {
+                let len = offs[t + 1] - offs[t];
+                let dst = if local { &mut o[base..base + len] } else { &mut o[offs[t]..offs[t + 1]] };
+                scatter_sum_seg(chunk, pos, maps[t], dst);
+                base += len;
+            }
+            pos += chunk.len();
+        }
+    };
+    let ranges = split(v.len(), 1);
+    if ranges.len() <= 1 || rest_total * ranges.len() > 2 * v.len() {
+        run(0..v.len(), outs, false);
+        return;
+    }
+    let partials = par_map(&ranges, |r| {
+        let mut o = vec![0.0; rest_total];
+        run(r, &mut o, true);
+        o
+    });
+    let mut base = 0;
+    for &t in &rest {
+        let len = offs[t + 1] - offs[t];
+        let out = &mut outs[offs[t]..offs[t + 1]];
+        for p in &partials {
+            for (x, &y) in out.iter_mut().zip(&p[base..base + len]) {
+                *x += y;
+            }
+        }
+        base += len;
     }
 }
 
@@ -630,27 +842,6 @@ fn broadcast_add_par(big: &mut [f64], m: Map, small: &[f64]) {
     par_chunks_mut(big, &ranges, |chunk, r| broadcast_add(chunk, m.range(r), small));
 }
 
-/// `out[map[k]] += v[k]` (out pre-zeroed), in parallel for large tables.
-#[inline(always)]
-fn scatter_sum_par(v: &[f64], m: Map, out: &mut [f64]) {
-    let ranges = split(v.len(), m.block);
-    if ranges.len() <= 1 {
-        scatter_sum(v, m, out);
-        return;
-    }
-    let n = out.len();
-    let partials = par_map(&ranges, |r| {
-        let mut o = vec![0.0; n];
-        scatter_sum(&v[r.clone()], m.range(r), &mut o);
-        o
-    });
-    for p in &partials {
-        for (x, &y) in out.iter_mut().zip(p) {
-            *x += y;
-        }
-    }
-}
-
 /// In-place `exp(x + shift)`, in parallel for large slices.
 #[inline(always)]
 fn exp_shift_par(v: &mut [f64], shift: f64) {
@@ -709,11 +900,14 @@ fn logsumexp(values: &[f64]) -> f64 {
 /// Leaves calibrated log-beliefs in `w.beliefs`.
 #[inline(always)]
 fn calibrate(plan: &Plan, w: &mut Work, theta: &[f64], how: Reduce) {
-    // Expand potentials onto the junction-tree cliques.
-    w.beliefs.fill(0.0);
-    for i in 0..plan.n_l() {
-        let j = plan.exp_parent[i] as usize;
-        broadcast_add_par(&mut w.beliefs[plan.j_range(j)], plan.exp_maps[i], &theta[plan.l_range(i)]);
+    // Expand potentials onto the junction-tree cliques (one fused pass per
+    // junction-tree clique).
+    for j in 0..plan.j_off.len() - 1 {
+        let terms: Vec<(Map, &[f64])> = plan.exp_groups[j]
+            .iter()
+            .map(|&i| (plan.exp_maps[i], &theta[plan.l_range(i)]))
+            .collect();
+        fused_broadcast_set(&mut w.beliefs[plan.j_range(j)], &terms);
     }
     w.sent.fill(false);
     for e in 0..plan.e_src.len() {
@@ -739,19 +933,52 @@ fn calibrate(plan: &Plan, w: &mut Work, theta: &[f64], how: Reduce) {
 }
 
 /// Marginals over the loss cliques, normalized to `total` (mirrors
-/// `_finalize_beliefs` with log-sum-exp).
+/// `_finalize_beliefs` with log-sum-exp). Each junction-tree clique that is
+/// read from is converted to probabilities once (`exp(b - logsumexp(b)) *
+/// total`); every loss-clique marginal is then a plain sum over it, instead
+/// of a separate log-sum-exp projection (max pass + exp pass) per loss clique.
 #[inline(always)]
 fn marginals(plan: &Plan, w: &mut Work, theta: &[f64], total: f64, mu: &mut [f64]) {
     calibrate(plan, w, theta, Reduce::LogSumExp);
     let log_total = total.ln();
-    for i in 0..plan.n_l() {
-        let j = plan.mar_parent[i] as usize;
-        let out = &mut mu[plan.l_range(i)];
-        let tmp = &mut w.tmp[..out.len()];
-        project(&w.beliefs[plan.j_range(j)], None, plan.mar_maps[i], tmp, &mut w.acc, Reduce::LogSumExp);
-        let shift = log_total - logsumexp(tmp);
-        out.copy_from_slice(tmp);
-        exp_shift_par(out, shift);
+    for j in 0..plan.j_off.len() - 1 {
+        let group = &plan.mar_groups[j];
+        if group.is_empty() {
+            continue;
+        }
+        let jr = plan.j_range(j);
+        let shift = log_total - logsumexp(&w.beliefs[jr.clone()]);
+        let (ident, other): (Vec<usize>, Vec<usize>) = group
+            .iter()
+            .partition(|&&i| plan.mar_maps[i].is_identity(plan.l_range(i).len()));
+        // Loss cliques equal to this table: exp straight into the output.
+        for &i in &ident {
+            let out = &mut mu[plan.l_range(i)];
+            out.copy_from_slice(&w.beliefs[jr.clone()]);
+            exp_shift_par(out, shift);
+        }
+        if other.is_empty() {
+            continue;
+        }
+        let p = &mut w.probs[jr.clone()];
+        match ident.first() {
+            Some(&i) => p.copy_from_slice(&mu[plan.l_range(i)]),
+            None => {
+                p.copy_from_slice(&w.beliefs[jr]);
+                exp_shift_par(p, shift);
+            }
+        }
+        let p: &[f64] = p;
+        let maps: Vec<Map> = other.iter().map(|&i| plan.mar_maps[i]).collect();
+        let mut offs = vec![0usize];
+        for &i in &other {
+            offs.push(offs.last().unwrap() + plan.l_range(i).len());
+        }
+        let buf = &mut w.mbuf[..*offs.last().unwrap()];
+        fused_scatter_sum(p, &maps, &offs, buf);
+        for (t, &i) in other.iter().enumerate() {
+            mu[plan.l_range(i)].copy_from_slice(&buf[offs[t]..offs[t + 1]]);
+        }
     }
 }
 
@@ -759,20 +986,19 @@ fn marginals(plan: &Plan, w: &mut Work, theta: &[f64], total: f64, mu: &mut [f64
 /// respect to the loss-clique marginals (mirrors `marginal_loss._l2_loss`).
 #[inline(always)]
 fn loss_and_grad(plan: &Plan, w: &mut Work, mu: &[f64], mut grad: Option<&mut [f64]>) -> f64 {
-    if let Some(g) = grad.as_deref_mut() {
-        let ranges = split(g.len(), 1);
-        par_chunks_mut(g, &ranges, |c, _| c.fill(0.0));
-    }
     let mut loss = 0.0;
-    for m in 0..plan.m_l.len() {
-        let i = plan.m_l[m] as usize;
-        let y = &plan.y[plan.m_off[m] as usize..plan.m_off[m + 1] as usize];
-        let inv_sd = plan.m_inv_sd[m];
-        let mu_l = &mu[plan.l_range(i)];
-        if plan.m_maps[m].is_identity(y.len()) {
-            // Measurement over the whole loss clique (same order): no
-            // projection needed.
-            let ranges = split(y.len(), 1);
+    for i in 0..plan.n_l() {
+        let group = &plan.m_groups[i];
+        let lr = plan.l_range(i);
+        let mu_l = &mu[lr.clone()];
+        let (ident, other): (Vec<usize>, Vec<usize>) = group.iter().partition(|&&m| {
+            plan.m_maps[m].is_identity((plan.m_off[m + 1] - plan.m_off[m]) as usize)
+        });
+        let ys = |m: usize| &plan.y[plan.m_off[m] as usize..plan.m_off[m + 1] as usize];
+        // Measurements over the whole loss clique: residuals read mu directly.
+        let ranges = split(mu_l.len(), 1);
+        for &m in &ident {
+            let (y, inv_sd) = (ys(m), plan.m_inv_sd[m]);
             loss += 0.5
                 * par_map(&ranges, |r| {
                     let mut s = 0.0;
@@ -784,28 +1010,51 @@ fn loss_and_grad(plan: &Plan, w: &mut Work, mu: &[f64], mut grad: Option<&mut [f
                 })
                 .iter()
                 .sum::<f64>();
-            if let Some(g) = grad.as_deref_mut() {
-                let g_l = &mut g[plan.l_range(i)];
-                par_chunks_mut(g_l, &ranges, |c, r| {
-                    for ((gk, &a), &b) in c.iter_mut().zip(&mu_l[r.clone()]).zip(&y[r]) {
-                        *gk += (a - b) * inv_sd * inv_sd;
-                    }
-                });
+        }
+        // Other measurements: project mu_L onto all of them in one pass, then
+        // turn the projections into d loss / d projection.
+        let maps: Vec<Map> = other.iter().map(|&m| plan.m_maps[m]).collect();
+        let mut offs = vec![0usize];
+        for &m in &other {
+            offs.push(offs.last().unwrap() + (plan.m_off[m + 1] - plan.m_off[m]) as usize);
+        }
+        let buf = &mut w.mbuf[..*offs.last().unwrap()];
+        if !other.is_empty() {
+            fused_scatter_sum(mu_l, &maps, &offs, buf);
+        }
+        for (t, &m) in other.iter().enumerate() {
+            let (y, inv_sd) = (ys(m), plan.m_inv_sd[m]);
+            let proj = &mut buf[offs[t]..offs[t + 1]];
+            let mut s = 0.0;
+            for (p, &yy) in proj.iter_mut().zip(y) {
+                let d = (*p - yy) * inv_sd;
+                s += d * d;
+                *p = d * inv_sd;
             }
-            continue;
+            loss += 0.5 * s;
         }
-        let proj = &mut w.tmp[..y.len()];
-        proj.fill(0.0);
-        scatter_sum_par(mu_l, plan.m_maps[m], proj);
-        let mut s = 0.0;
-        for (p, &yy) in proj.iter_mut().zip(y.iter()) {
-            let d = (*p - yy) * inv_sd;
-            s += d * d;
-            *p = d * inv_sd; // d loss / d proj
-        }
-        loss += 0.5 * s;
+        // Gradient: one cache-blocked pass over grad_L.
         if let Some(g) = grad.as_deref_mut() {
-            broadcast_add_par(&mut g[plan.l_range(i)], plan.m_maps[m], proj);
+            let buf: &[f64] = buf;
+            let g_l = &mut g[lr];
+            par_chunks_mut(g_l, &ranges, |part, r| {
+                let mut pos = r.start;
+                for chunk in part.chunks_mut(FUSE_CHUNK) {
+                    let cr = pos..pos + chunk.len();
+                    chunk.fill(0.0);
+                    for &m in &ident {
+                        let (y, inv_sd) = (ys(m), plan.m_inv_sd[m]);
+                        let w2 = inv_sd * inv_sd;
+                        for ((x, &a), &b) in chunk.iter_mut().zip(&mu_l[cr.clone()]).zip(&y[cr.clone()]) {
+                            *x += (a - b) * w2;
+                        }
+                    }
+                    for (t, &mp) in maps.iter().enumerate() {
+                        broadcast_add_seg(chunk, pos, mp, &buf[offs[t]..offs[t + 1]]);
+                    }
+                    pos += chunk.len();
+                }
+            });
         }
     }
     loss

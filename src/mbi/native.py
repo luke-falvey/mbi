@@ -40,6 +40,7 @@ import sys
 from collections.abc import Callable, Sequence
 
 import jax.numpy as jnp
+import networkx as nx
 import numpy as np
 
 from . import estimation, junction_tree, marginal_loss
@@ -230,6 +231,14 @@ def _structure(
   )[0]
   order = junction_tree.message_passing_order(jtree)
   maximal = junction_tree.maximal_cliques(jtree)
+  # Internal layout of each junction-tree table: attributes from smallest to
+  # largest domain, so trailing runs (and hence vectorized blocks) are long.
+  position = {a: i for i, a in enumerate(domain.attributes)}
+  layout_key = lambda a: (domain[a], position[a])
+  layout = {c: tuple(sorted(c, key=layout_key)) for c in maximal}
+  order = [(layout[i], layout[j]) for i, j in order]
+  maximal = [layout[c] for c in maximal]
+  jtree = nx.relabel_nodes(jtree, layout)
   jindex = {c: i for i, c in enumerate(maximal)}
 
   rev = reverse_clique_mapping(maximal, loss_cliques, domain=domain)
@@ -250,8 +259,8 @@ def _structure(
   e_src, e_dst, e_rev, sep_sizes, src_maps, dst_maps = [], [], [], [], [], []
   src_bk, dst_bk = [], []
   for i, j in order:
-    # Canonical (domain) order, so a message and its reverse share a layout.
-    sep = domain.canonical(set(i) & set(j))
+    # Same layout rule as the cliques, so a message and its reverse share it.
+    sep = tuple(sorted(set(i) & set(j), key=layout_key))
     src_bk.append(_block(domain, i, sep))
     dst_bk.append(_block(domain, j, sep))
     e_src.append(jindex[i])
@@ -728,6 +737,9 @@ class NativeMirrorDescent(estimation.MirrorDescent):
     )
     if status != 0:
       raise RuntimeError(f"mbi native library failed with status {status}")
+    if os.environ.get("MBI_NATIVE_DEBUG"):
+      print(f"[native] cells={int(plan.structure.arrays['j_off'][-1])} "
+            f"steps={int(info[0])} gap={info[1]:.2e}", file=sys.stderr)
     return MarkovRandomField(
         potentials=_unflatten(theta, domain, cliques),
         marginals=_unflatten(mu, domain, cliques),
