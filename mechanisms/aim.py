@@ -15,8 +15,8 @@ default JAX settings almost all of its runtime is spent compiling XLA programs
 (2) merging repeated measurements of the same clique so the fitted program's
 structure (and compile cache entry) is reused, (3) fitting with
 ``MirrorDescent(fuse_steps=False)``, which compiles ~5x faster, optionally with
-``fast_compile`` for small models, and (4) periodically clearing JAX's caches so
-long runs don't exhaust the process's memory-map limit.  None of these change
+``fast_compile`` for small models, and (4) clearing JAX's caches when the process
+nears its memory-map limit, so long runs don't crash.  None of these change
 the selected cliques or the fitted model beyond floating-point rounding.
 """
 
@@ -147,6 +147,23 @@ def merge_measurements(measurements):
     return merged
 
 
+def _memory_map_usage():
+    """Fraction of the per-process memory-map limit in use (Linux), or None.
+
+    Every compiled XLA program holds memory mappings until JAX's caches are
+    cleared; a process that exceeds ``vm.max_map_count`` fails with "LLVM
+    compilation error: Cannot allocate memory".
+    """
+    try:
+        with open("/proc/self/maps") as f:
+            used = sum(1 for _ in f)
+        with open("/proc/sys/vm/max_map_count") as f:
+            limit = int(f.read())
+    except (OSError, ValueError):
+        return None
+    return used / limit
+
+
 class _NumpyMarginals:
     """Answers marginal queries on a fitted model with NumPy (no JIT)."""
 
@@ -190,6 +207,7 @@ class AIM(Mechanism):
         fuse_steps=False,
         fast_compile_max_cells=100_000,
         clear_caches_every=25,
+        clear_caches_map_fraction=0.5,
         parallel_compile=None,
         intermediate_iters=None,
     ):
@@ -199,9 +217,12 @@ class AIM(Mechanism):
         :param fast_compile_max_cells: fit with ``MirrorDescent(fast_compile=True)``
             while the model's junction tree has at most this many cells (where
             compile time dwarfs compute time).  Set to 0 to disable.
-        :param clear_caches_every: call ``jax.clear_caches()`` every this many
-            rounds, releasing compiled programs for model structures that won't
-            be seen again.  Set to ``None`` to disable.
+        :param clear_caches_every: every this many rounds, call
+            ``jax.clear_caches()`` if the process uses more than
+            ``clear_caches_map_fraction`` of its memory-map limit (Linux only;
+            clearing is slow and forces recompiles, so it is only done when
+            needed).  Set to ``None`` to disable.
+        :param clear_caches_map_fraction: see ``clear_caches_every``.
         :param parallel_compile: passed to ``MirrorDescent``; compiles the
             independent programs of each fit concurrently.  Defaults to ``True``
             when more than one CPU is available.
@@ -222,6 +243,7 @@ class AIM(Mechanism):
         self.fuse_steps = fuse_steps
         self.fast_compile_max_cells = fast_compile_max_cells
         self.clear_caches_every = clear_caches_every
+        self.clear_caches_map_fraction = clear_caches_map_fraction
         if parallel_compile is None:
             if hasattr(_os, "sched_getaffinity"):
                 ncpu = len(_os.sched_getaffinity(0))
@@ -299,7 +321,9 @@ class AIM(Mechanism):
         while not terminate:
             t += 1
             if self.clear_caches_every and t % self.clear_caches_every == 0:
-                jax.clear_caches()
+                usage = _memory_map_usage()
+                if usage is not None and usage > self.clear_caches_map_fraction:
+                    jax.clear_caches()
             if self.rho - rho_used < 2 * (
                 0.5 / sigma**2 + 1.0 / 8 * epsilon**2
             ):

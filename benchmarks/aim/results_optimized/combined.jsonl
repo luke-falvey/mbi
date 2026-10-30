@@ -1,0 +1,102 @@
+{"name": "combined:r5000_c5_b8", "event": "start", "rows": 5000, "cols": 5, "bins": 8, "epsilon": 1.0, "max_model_size": 80, "max_iters": 1000, "seed": 0, "out": "results_optimized/combined.jsonl", "impl": "optimized", "jax": "0.12.0.1", "threads_env": "--xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1"}
+{"name": "combined:r5000_c5_b8", "event": "round", "round": 1, "selected": ["bool_3", "cont_4"], "t_elapsed": 1.756420679999792}
+{"name": "combined:r5000_c5_b8", "event": "round", "round": 2, "selected": ["cate_2", "bool_3"], "t_elapsed": 3.519473938000374}
+{"name": "combined:r5000_c5_b8", "event": "round", "round": 3, "selected": ["inte_1", "bool_3"], "t_elapsed": 5.289699319000647}
+{"name": "combined:r5000_c5_b8", "event": "round", "round": 4, "selected": ["cont_0", "bool_3"], "t_elapsed": 7.192312457000298}
+{"name": "combined:r5000_c5_b8", "event": "round", "round": 5, "selected": ["inte_1"], "t_elapsed": 8.773542487000668}
+{"name": "combined:r5000_c5_b8", "event": "round", "round": 6, "selected": ["cont_0", "inte_1"], "t_elapsed": 8.845029427000554}
+{"name": "combined:r5000_c5_b8", "event": "round", "round": 7, "selected": ["cate_2", "bool_3"], "t_elapsed": 11.617624847000116}
+{"name": "combined:r5000_c5_b8", "event": "round", "round": 8, "selected": ["inte_1", "cate_2"], "t_elapsed": 11.686128430999815}
+{"name": "combined:r5000_c5_b8", "event": "round", "round": 9, "selected": ["cont_0", "inte_1"], "t_elapsed": 14.25280611800008}
+{"name": "combined:r5000_c5_b8", "event": "round", "round": 10, "selected": ["inte_1", "cont_4"], "t_elapsed": 14.49117798000043}
+{"name": "combined:r5000_c5_b8", "event": "done", "domain": {"cont_0": 8, "inte_1": 8, "cate_2": 8, "bool_3": 2, "cont_4": 8}, "rounds": 10, "t_wall": 19.329908116998922, "t_make_raw": 0.006703560000460129, "t_discretize": 0.005598214000201551, "t_aim_total": 19.314211377999527, "t_compile_total": 17.369118452072144, "n_compiles": 125, "phases": {"fit": 17.24179648000245, "fit/jit_compile": 15.648871898651123, "select/worst_approximated": 0.03762632599864446, "select/jit_compile": 0.0, "generate/synthetic_data": 1.4453938940005173}, "phase_calls": {"fit": 12, "fit/jit_compile": 12, "select/worst_approximated": 10, "select/jit_compile": 10, "generate/synthetic_data": 1}, "avg_tv_error": 0.053780000656843185}
+{"name": "combined:r5000_c5_b8", "event": "exit", "status": "ok", "elapsed": 21.581145763397217, "rows": 5000, "cols": 5, "bins": 8}
+{"name": "combined:r100000_c12_b16", "event": "start", "rows": 100000, "cols": 12, "bins": 16, "epsilon": 1.0, "max_model_size": 80, "max_iters": 1000, "seed": 0, "out": "/home/user/mbi/benchmarks/aim/results_optimized/combined.jsonl", "impl": "optimized", "jax": "0.12.0.1", "threads_env": "--xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1"}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 1, "selected": ["bool_7", "cont_8"], "t_elapsed": 2.8248757399996975}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 2, "selected": ["cont_8", "inte_9"], "t_elapsed": 5.8035964549999335}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 3, "selected": ["cont_4", "inte_5"], "t_elapsed": 10.044813044998591}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 4, "selected": ["bool_3", "cont_4"], "t_elapsed": 14.538964798999586}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 5, "selected": ["inte_9", "bool_11"], "t_elapsed": 18.64373704299942}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 6, "selected": ["inte_5", "bool_7"], "t_elapsed": 23.27802256399991}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 7, "selected": ["inte_1", "bool_3"], "t_elapsed": 27.756971979999435}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 8, "selected": ["cont_0", "inte_1"], "t_elapsed": 32.489755746999435}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 9, "selected": ["cate_10", "bool_11"], "t_elapsed": 39.62817976899896}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 10, "selected": ["cate_6", "bool_7"], "t_elapsed": 45.31775354799902}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 11, "selected": ["cate_2", "bool_3"], "t_elapsed": 51.31134285399821}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 12, "selected": ["bool_3", "bool_11"], "t_elapsed": 56.794007378999595}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 13, "selected": ["inte_1", "bool_7"], "t_elapsed": 64.69639363899842}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 14, "selected": ["bool_7", "cate_10"], "t_elapsed": 72.38083443599862}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 15, "selected": ["inte_5", "bool_11"], "t_elapsed": 80.23344011899826}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 16, "selected": ["bool_3", "cate_6"], "t_elapsed": 89.01381826099896}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 17, "selected": ["bool_3", "inte_9"], "t_elapsed": 97.43468908699833}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 18, "selected": ["inte_1", "bool_11"], "t_elapsed": 107.6673184479987}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 19, "selected": ["cate_2", "bool_11"], "t_elapsed": 118.00674910599992}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 20, "selected": ["cate_6", "bool_11"], "t_elapsed": 128.73792825299824}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 21, "selected": ["bool_3", "cate_10"], "t_elapsed": 139.0918227079983}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 22, "selected": ["bool_7", "bool_11"], "t_elapsed": 150.3592534319996}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 23, "selected": ["cate_2", "bool_7"], "t_elapsed": 161.79592740399858}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 24, "selected": ["bool_3", "bool_7"], "t_elapsed": 173.0336310169987}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 25, "selected": ["cont_4", "bool_7"], "t_elapsed": 184.2685452329988}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 26, "selected": ["cont_0", "bool_7"], "t_elapsed": 196.47412879999865}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 27, "selected": ["bool_3", "cont_8"], "t_elapsed": 208.70140659499884}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 28, "selected": ["cont_4", "bool_11"], "t_elapsed": 221.32978239699878}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 29, "selected": ["bool_3", "inte_5"], "t_elapsed": 235.08624871899883}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 30, "selected": ["cont_8", "bool_11"], "t_elapsed": 249.20991890999903}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 31, "selected": ["bool_7", "inte_9"], "t_elapsed": 263.8359163919995}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 32, "selected": ["cont_0", "bool_3"], "t_elapsed": 279.66806529899986}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 33, "selected": ["cont_0", "bool_11"], "t_elapsed": 293.927160539999}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 34, "selected": ["cont_8"], "t_elapsed": 308.53676710999935}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 35, "selected": ["inte_1", "cate_2"], "t_elapsed": 309.52653313799965}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 36, "selected": ["inte_9", "cate_10"], "t_elapsed": 328.28306096899905}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 37, "selected": ["inte_5", "cate_6"], "t_elapsed": 350.04607141699853}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 38, "selected": ["inte_5", "cont_8"], "t_elapsed": 376.85661632399933}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 39, "selected": ["inte_1", "cont_4"], "t_elapsed": 402.70016776399825}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 40, "selected": ["cont_4", "inte_5"], "t_elapsed": 429.8083719469996}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 41, "selected": ["cont_0", "inte_1"], "t_elapsed": 442.19535969799836}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 42, "selected": ["cont_8", "inte_9"], "t_elapsed": 453.81040158199903}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 43, "selected": ["inte_1", "inte_9"], "t_elapsed": 466.2896301839992}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 44, "selected": ["inte_5", "bool_11"], "t_elapsed": 500.66710980699827}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 45, "selected": ["cont_4", "bool_7"], "t_elapsed": 504.5473000189995}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 46, "selected": ["bool_7", "cont_8"], "t_elapsed": 508.89866418399833}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 47, "selected": ["cate_2", "bool_11"], "t_elapsed": 514.4671634159986}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 48, "selected": ["cont_8", "bool_11"], "t_elapsed": 518.9637158529986}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 49, "selected": ["inte_1", "bool_11"], "t_elapsed": 523.5990865169988}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 50, "selected": ["cont_0"], "t_elapsed": 533.5018666549986}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 51, "selected": ["inte_5", "cate_6"], "t_elapsed": 559.2691194899999}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 52, "selected": ["inte_9", "cate_10"], "t_elapsed": 570.0802039259997}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 53, "selected": ["inte_1", "cont_4"], "t_elapsed": 578.844897519999}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 54, "selected": ["inte_1", "cate_2"], "t_elapsed": 586.7829834539989}
+{"name": "combined:r100000_c12_b16", "event": "round", "round": 55, "selected": ["inte_1", "inte_9"], "t_elapsed": 599.0192780519992}
+{"name": "combined:r100000_c12_b16", "event": "done", "domain": {"cont_0": 16, "inte_1": 16, "cate_2": 16, "bool_3": 2, "cont_4": 16, "inte_5": 16, "cate_6": 16, "bool_7": 2, "cont_8": 16, "inte_9": 16, "cate_10": 16, "bool_11": 2}, "rounds": 55, "t_wall": 621.937409053, "t_make_raw": 0.7460077920004551, "t_discretize": 0.07380043899865996, "t_aim_total": 620.8769087750006, "t_compile_total": 385.24992775917053, "n_compiles": 440, "phases": {"fit": 599.883222245011, "fit/jit_compile": 377.8828990459442, "select/worst_approximated": 4.157223074000285, "select/jit_compile": 0.03086113929748535, "generate/synthetic_data": 6.830579657998896}, "phase_calls": {"fit": 57, "fit/jit_compile": 57, "select/worst_approximated": 55, "select/jit_compile": 55, "generate/synthetic_data": 1}, "avg_tv_error": 0.018737273290753365}
+{"name": "combined:r100000_c12_b16", "event": "exit", "status": "ok", "elapsed": 624.5676436424255, "rows": 100000, "cols": 12, "bins": 16}
+{"name": "combined:r20000_c8_b16", "event": "start", "rows": 20000, "cols": 8, "bins": 16, "epsilon": 1.0, "max_model_size": 80, "max_iters": 1000, "seed": 0, "out": "/home/user/mbi/benchmarks/aim/results_optimized/combined.jsonl", "impl": "optimized", "jax": "0.12.0.1", "threads_env": "--xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1"}
+{"name": "combined:r20000_c8_b16", "event": "round", "round": 1, "selected": ["bool_3", "cont_4"], "t_elapsed": 2.1840107159987383}
+{"name": "combined:r20000_c8_b16", "event": "round", "round": 2, "selected": ["bool_3", "bool_7"], "t_elapsed": 4.6129528940000455}
+{"name": "combined:r20000_c8_b16", "event": "round", "round": 3, "selected": ["inte_5", "bool_7"], "t_elapsed": 6.994959083998765}
+{"name": "combined:r20000_c8_b16", "event": "round", "round": 4, "selected": ["inte_1", "bool_3"], "t_elapsed": 9.775141574998997}
+{"name": "combined:r20000_c8_b16", "event": "round", "round": 5, "selected": ["cate_2", "bool_3"], "t_elapsed": 12.60343323699999}
+{"name": "combined:r20000_c8_b16", "event": "round", "round": 6, "selected": ["cate_6", "bool_7"], "t_elapsed": 15.598749928998586}
+{"name": "combined:r20000_c8_b16", "event": "round", "round": 7, "selected": ["cont_0", "bool_3"], "t_elapsed": 18.498943795999367}
+{"name": "combined:r20000_c8_b16", "event": "round", "round": 8, "selected": ["bool_3", "inte_5"], "t_elapsed": 21.558084035999855}
+{"name": "combined:r20000_c8_b16", "event": "round", "round": 9, "selected": ["cont_4", "bool_7"], "t_elapsed": 24.946024425998985}
+{"name": "combined:r20000_c8_b16", "event": "round", "round": 10, "selected": ["inte_1", "bool_7"], "t_elapsed": 28.662683299999117}
+{"name": "combined:r20000_c8_b16", "event": "round", "round": 11, "selected": ["bool_3", "cate_6"], "t_elapsed": 32.88742860399907}
+{"name": "combined:r20000_c8_b16", "event": "round", "round": 12, "selected": ["cont_0", "bool_7"], "t_elapsed": 37.817984620998686}
+{"name": "combined:r20000_c8_b16", "event": "round", "round": 13, "selected": ["cate_2", "bool_7"], "t_elapsed": 43.06006609599899}
+{"name": "combined:r20000_c8_b16", "event": "round", "round": 14, "selected": ["cate_2"], "t_elapsed": 48.35933517099875}
+{"name": "combined:r20000_c8_b16", "event": "round", "round": 15, "selected": ["cont_4", "inte_5"], "t_elapsed": 48.73385512299865}
+{"name": "combined:r20000_c8_b16", "event": "round", "round": 16, "selected": ["cont_0", "inte_1"], "t_elapsed": 55.11044313799903}
+{"name": "combined:r20000_c8_b16", "event": "round", "round": 17, "selected": ["cont_4", "bool_7"], "t_elapsed": 62.463545977998365}
+{"name": "combined:r20000_c8_b16", "event": "round", "round": 18, "selected": ["bool_3", "cate_6"], "t_elapsed": 63.5438998519985}
+{"name": "combined:r20000_c8_b16", "event": "round", "round": 19, "selected": ["cont_0", "bool_7"], "t_elapsed": 64.1632435169995}
+{"name": "combined:r20000_c8_b16", "event": "round", "round": 20, "selected": ["inte_1", "bool_3"], "t_elapsed": 64.87657825699898}
+{"name": "combined:r20000_c8_b16", "event": "round", "round": 21, "selected": ["cate_2", "bool_7"], "t_elapsed": 65.63042683599997}
+{"name": "combined:r20000_c8_b16", "event": "round", "round": 22, "selected": ["bool_3", "cont_4"], "t_elapsed": 66.50709583499884}
+{"name": "combined:r20000_c8_b16", "event": "round", "round": 23, "selected": ["inte_5", "bool_7"], "t_elapsed": 67.52897511099945}
+{"name": "combined:r20000_c8_b16", "event": "round", "round": 24, "selected": ["cont_0", "bool_3"], "t_elapsed": 70.30354154499946}
+{"name": "combined:r20000_c8_b16", "event": "round", "round": 25, "selected": ["cate_2", "bool_3"], "t_elapsed": 71.20118860000002}
+{"name": "combined:r20000_c8_b16", "event": "round", "round": 26, "selected": ["cont_0", "inte_1"], "t_elapsed": 72.04090836299838}
+{"name": "combined:r20000_c8_b16", "event": "round", "round": 27, "selected": ["cont_4", "inte_5"], "t_elapsed": 74.39767850799944}
+{"name": "combined:r20000_c8_b16", "event": "round", "round": 28, "selected": ["inte_5", "cate_6"], "t_elapsed": 76.71528880999904}
+{"name": "combined:r20000_c8_b16", "event": "done", "domain": {"cont_0": 16, "inte_1": 16, "cate_2": 16, "bool_3": 2, "cont_4": 16, "inte_5": 16, "cate_6": 16, "bool_7": 2}, "rounds": 28, "t_wall": 90.16009630700137, "t_make_raw": 0.02708200600136479, "t_discretize": 0.013196292999055004, "t_aim_total": 90.10601782099911, "t_compile_total": 63.32507014274597, "n_compiles": 207, "phases": {"fit": 85.51779136100231, "fit/jit_compile": 59.95128870010376, "select/worst_approximated": 0.380125127005158, "select/jit_compile": 0.0, "generate/synthetic_data": 3.012990049999644}, "phase_calls": {"fit": 30, "fit/jit_compile": 30, "select/worst_approximated": 28, "select/jit_compile": 28, "generate/synthetic_data": 1}, "avg_tv_error": 0.04959285631775856}
+{"name": "combined:r20000_c8_b16", "event": "exit", "status": "ok", "elapsed": 93.44395422935486, "rows": 20000, "cols": 8, "bins": 16}

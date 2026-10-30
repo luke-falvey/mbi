@@ -27,4 +27,4 @@ for rows in (100_000, 1_000_000, 5_000_000, 10_000_000):
   rec = dict(rows=rows, t_make_raw=t_make, t_discretize=t_disc,
              t_count_all_2way=t_ans, n_2way=len(pairs), t_synthetic_data=t_gen)
   print(json.dumps(rec), flush=True); out.append(rec)
-json.dump(out, open("results/gen_scaling.json", "w"), indent=1)
+json.dump(out, open(sys.argv[1] if len(sys.argv) > 1 else "results/gen_scaling.json", "w"), indent=1)

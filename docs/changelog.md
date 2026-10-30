@@ -9,7 +9,7 @@ This page documents the history of changes for each version of `mbi`.
     * The convergence check (`primal_dual_gap`) in `Estimator.estimate` is now one jitted program instead of an op-by-op gradient plus a separately compiled oracle call.
     * New `marginal_oracles.variable_elimination_numpy`, a NumPy (no-JIT) equivalent of `variable_elimination` for querying many out-of-model marginals.
     * `MarkovRandomField.synthetic_data` groups parent configurations with integer keys instead of `np.unique(..., axis=0)`, which was the bottleneck for large row counts. Output is bit-for-bit identical for the same seed.
-    * `mechanisms/aim.py` scores candidates with NumPy, merges repeated measurements of the same clique, uses the options above, caches junction-tree sizes, and periodically clears JAX caches (long runs previously crashed by exhausting the process memory-map limit). It also gains an opt-in `intermediate_iters` setting.
+    * `mechanisms/aim.py` scores candidates with NumPy, merges repeated measurements of the same clique, uses the options above, caches junction-tree sizes, and clears JAX caches when the process nears its memory-map limit (long runs previously crashed with "LLVM compilation error: Cannot allocate memory"). It also gains an opt-in `intermediate_iters` setting.
 
 ## Version 2.0.0 - 09/2026
 

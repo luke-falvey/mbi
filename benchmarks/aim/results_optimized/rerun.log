@@ -1,0 +1,10 @@
+END cols:r10000_c20_b16 ok 589s
+END combined:r100000_c12_b16 ok 625s
+END cols:r10000_c24_b16 ok 779s
+END rows:r100000_c8_b16 ok 168s
+END cols:r10000_c16_b16 ok 289s
+END combined:r20000_c8_b16 ok 93s
+END rows:r10000_c8_b16 ok 76s
+END cols:r10000_c12_b16 ok 198s
+END rows:r1000000_c8_b16 timeout 1500s
+ALL DONE

@@ -11,6 +11,7 @@ import itertools
 import os
 import sys
 import unittest
+import unittest.mock
 
 import jax
 import numpy as np
@@ -278,13 +279,44 @@ class TestAIMEndToEnd(unittest.TestCase):
       ("serial_compile", dict(parallel_compile=False)),
       ("parallel_compile", dict(parallel_compile=True)),
       ("fused_no_fast_compile", dict(fuse_steps=True, fast_compile_max_cells=0)),
-      ("clear_caches_every_round", dict(clear_caches_every=1)),
+      ("clear_caches_every_round",
+       dict(clear_caches_every=1, clear_caches_map_fraction=0.0)),
       ("never_clear_caches", dict(clear_caches_every=None)),
       ("intermediate_iters_equal_max_iters", dict(intermediate_iters=200)),
   ])
   def test_matches_reference(self, name, kwargs):
     del name
     self._check(_run(aim.AIM, self.data, self.workload, **kwargs))
+
+
+class TestMemoryMapUsage(unittest.TestCase):
+
+  def test_usage_fraction(self):
+    usage = aim._memory_map_usage()
+    if not os.path.exists("/proc/self/maps"):
+      self.assertIsNone(usage)
+    else:
+      self.assertGreater(usage, 0.0)
+      self.assertLess(usage, 1.0)
+
+  def test_clears_only_when_over_threshold(self):
+    data = _dataset(rows=500, seed=9)
+    workload = [(cl, 1.0) for cl in itertools.combinations(data.domain, 2)]
+    calls = {"n": 0}
+    orig = jax.clear_caches
+
+    def counting():
+      calls["n"] += 1
+      orig()
+
+    with unittest.mock.patch.object(aim.jax, "clear_caches", counting):
+      _run(aim.AIM, data, workload, clear_caches_every=1,
+           clear_caches_map_fraction=1.0)
+      self.assertEqual(calls["n"], 0)
+      if aim._memory_map_usage() is not None:
+        _run(aim.AIM, data, workload, clear_caches_every=1,
+             clear_caches_map_fraction=0.0)
+        self.assertGreater(calls["n"], 0)
 
 
 class TestAIMIntermediateIters(unittest.TestCase):
