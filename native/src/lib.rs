@@ -1009,27 +1009,62 @@ fn fused_scatter_sum(v: &[f64], maps: &[Map], offs: &[usize], outs: &mut [f64]) 
     // attribute(s), split along them so each part writes its own output
     // ranges directly (no partial buffers). Lead blocks are suffix products
     // of the big table's shape, so the largest is a multiple of the others.
-    let lead = rest.iter().map(|&t| maps[t].lead).max().unwrap_or(0);
-    if v.len() >= PAR_MIN_CELLS && rest.iter().all(|&t| maps[t].lead > 0) && v.len() / lead >= 2 {
+    // Disjoint / mixed path: split along the leading attribute(s) kept by
+    // the maps that have them (lead > 0). Those maps write each part's
+    // results straight into their own disjoint output sub-slices; the other
+    // maps accumulate into small per-part partial buffers, combined after.
+    // Lead blocks are suffix products of the big table's shape, so the
+    // largest is a multiple of the others.
+    let lead_maps: Vec<usize> = rest.iter().cloned().filter(|&t| maps[t].lead > 0).collect();
+    let other: Vec<usize> = rest.iter().cloned().filter(|&t| maps[t].lead == 0).collect();
+    let lead = lead_maps.iter().map(|&t| maps[t].lead).max().unwrap_or(0);
+    let other_total: usize = other.iter().map(|&t| offs[t + 1] - offs[t]).sum();
+    if v.len() >= PAR_MIN_CELLS && lead > 0 && v.len() / lead >= 2 && other_total * 16 <= v.len() {
         let n_lead = v.len() / lead;
         let parts = n_lead.min(16);
         let ranges: Vec<std::ops::Range<usize>> =
             (0..parts).map(|p| (n_lead * p / parts) * lead..(n_lead * (p + 1) / parts) * lead).collect();
-        for &t in &rest {
-            let m = maps[t];
-            let outr: Vec<std::ops::Range<usize>> =
-                ranges.iter().map(|r| m.idx[r.start] as usize..m.idx[r.end - 1] as usize + 1).collect();
-            let out = &mut outs[offs[t]..offs[t + 1]];
-            par_chunks_mut(out, &outr, |o, r| {
-                let i = outr.iter().position(|q| q.start == r.start).unwrap();
-                let vr = ranges[i].clone();
-                let pm = Map { idx: &m.idx[vr.clone()], block: m.block, kept: m.kept, lead: m.lead, off: r.start };
-                let mut pos = 0;
-                for chunk in v[vr].chunks(FUSE_CHUNK) {
-                    scatter_sum_seg(chunk, pos, pm, o);
-                    pos += chunk.len();
+        let base = SlicePtr(outs.as_mut_ptr());
+        let partials = par_map(&ranges, |vr| {
+            let mut part = vec![0.0; other_total];
+            // Each lead map's output range for this part.
+            let views: Vec<(Map, &mut [f64])> = lead_maps
+                .iter()
+                .map(|&t| {
+                    let m = maps[t];
+                    let (o0, o1) = (m.idx[vr.start] as usize, m.idx[vr.end - 1] as usize + 1);
+                    // Safe: parts own disjoint output ranges of lead maps.
+                    let o = unsafe { std::slice::from_raw_parts_mut(base.get().add(offs[t] + o0), o1 - o0) };
+                    (Map { idx: &m.idx[vr.clone()], block: m.block, kept: m.kept, lead: m.lead, off: o0 }, o)
+                })
+                .collect();
+            let mut views = views;
+            let mut pos = vr.start;
+            for chunk in v[vr.clone()].chunks(FUSE_CHUNK) {
+                let rel = pos - vr.start;
+                for (m, o) in views.iter_mut() {
+                    scatter_sum_seg(chunk, rel, *m, o);
                 }
-            });
+                let mut b0 = 0;
+                for &t in &other {
+                    let len = offs[t + 1] - offs[t];
+                    scatter_sum_seg(chunk, pos, maps[t], &mut part[b0..b0 + len]);
+                    b0 += len;
+                }
+                pos += chunk.len();
+            }
+            part
+        });
+        let mut b0 = 0;
+        for &t in &other {
+            let len = offs[t + 1] - offs[t];
+            let out = &mut outs[offs[t]..offs[t + 1]];
+            for p in &partials {
+                for (x, &y) in out.iter_mut().zip(&p[b0..b0 + len]) {
+                    *x += y;
+                }
+            }
+            b0 += len;
         }
         return;
     }
