@@ -252,68 +252,172 @@ fn split(len: usize, block: usize) -> Vec<std::ops::Range<usize>> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Persistent worker pool
+// ---------------------------------------------------------------------------
+
+/// A job: `n_tasks` calls of a closure, identified by a type-erased pointer
+/// (valid until `Pool::run` returns, which waits for every task).
+#[derive(Clone, Copy)]
+struct Job {
+    f: *const (dyn Fn(usize) + Sync),
+    n_tasks: usize,
+    /// Generation of the job; a worker only takes tasks from the job it was
+    /// woken for (a stale copy must never run tasks of a newer job).
+    gen: u64,
+}
+unsafe impl Send for Job {}
+
+struct PoolState {
+    job: Option<Job>,
+    generation: u64,
+    next: usize,
+    done: usize,
+}
+
+/// Worker threads parked on a condition variable between jobs, so parallel
+/// sections cost a wake-up instead of spawning threads (which costs tens of
+/// microseconds per thread and made parallelism pay only for huge tables).
+struct Pool {
+    workers: usize,
+    state: std::sync::Mutex<PoolState>,
+    work: std::sync::Condvar,
+    finished: std::sync::Condvar,
+    /// Held while a job runs; a concurrent or nested `run` falls back to
+    /// running serially on the caller's thread.
+    busy: std::sync::Mutex<()>,
+}
+
+impl Pool {
+    fn get() -> &'static Pool {
+        static POOL: std::sync::OnceLock<&'static Pool> = std::sync::OnceLock::new();
+        POOL.get_or_init(|| {
+            let workers = n_threads().saturating_sub(1);
+            let pool: &'static Pool = Box::leak(Box::new(Pool {
+                workers,
+                state: std::sync::Mutex::new(PoolState { job: None, generation: 0, next: 0, done: 0 }),
+                work: std::sync::Condvar::new(),
+                finished: std::sync::Condvar::new(),
+                busy: std::sync::Mutex::new(()),
+            }));
+            for _ in 0..workers {
+                std::thread::spawn(move || pool.worker());
+            }
+            pool
+        })
+    }
+
+    fn worker(&self) {
+        let mut seen = 0u64;
+        loop {
+            let job = {
+                let mut st = self.state.lock().unwrap();
+                while st.generation == seen || st.job.is_none() {
+                    st = self.work.wait(st).unwrap();
+                }
+                seen = st.generation;
+                st.job.unwrap()
+            };
+            self.drain(job);
+        }
+    }
+
+    /// Run tasks of `job` until none are left.
+    fn drain(&self, job: Job) {
+        loop {
+            let i = {
+                let mut st = self.state.lock().unwrap();
+                if st.job.is_none() || st.generation != job.gen || st.next >= job.n_tasks {
+                    return;
+                }
+                st.next += 1;
+                st.next - 1
+            };
+            // Safe: `run` keeps the closure alive until all tasks are done.
+            unsafe { (*job.f)(i) };
+            let mut st = self.state.lock().unwrap();
+            st.done += 1;
+            if st.done == job.n_tasks {
+                self.finished.notify_all();
+            }
+        }
+    }
+
+    /// Call `f(0..n_tasks)` across the pool (the caller works too).
+    fn run(&self, n_tasks: usize, f: &(dyn Fn(usize) + Sync)) {
+        let guard = match self.busy.try_lock() {
+            Ok(g) if self.workers > 0 && n_tasks > 1 => g,
+            _ => {
+                (0..n_tasks).for_each(f);
+                return;
+            }
+        };
+        // Erase the closure's lifetime: it outlives the job because we wait
+        // for every task below before returning.
+        let f_static: *const (dyn Fn(usize) + Sync) = unsafe { std::mem::transmute(f as *const (dyn Fn(usize) + Sync)) };
+        let job = {
+            let mut st = self.state.lock().unwrap();
+            st.generation += 1;
+            let job = Job { f: f_static, n_tasks, gen: st.generation };
+            st.job = Some(job);
+            st.next = 0;
+            st.done = 0;
+            job
+        };
+        self.work.notify_all();
+        self.drain(job);
+        let mut st = self.state.lock().unwrap();
+        while st.done < n_tasks {
+            st = self.finished.wait(st).unwrap();
+        }
+        st.job = None;
+        drop(st);
+        drop(guard);
+    }
+}
+
 /// Evaluate `f` on each range (in parallel when there are several) and
 /// return the results in range order.
 fn par_map<R: Send>(ranges: &[std::ops::Range<usize>], f: impl Fn(std::ops::Range<usize>) -> R + Sync) -> Vec<R> {
-    let t = n_threads().min(ranges.len());
-    if t <= 1 {
+    if n_threads() <= 1 || ranges.len() <= 1 {
         return ranges.iter().map(|r| f(r.clone())).collect();
     }
-    let f = &f;
-    let mut out: Vec<(usize, R)> = std::thread::scope(|sc| {
-        let hs: Vec<_> = (0..t)
-            .map(|w| {
-                sc.spawn(move || {
-                    (w..ranges.len())
-                        .step_by(t)
-                        .map(|i| (i, f(ranges[i].clone())))
-                        .collect::<Vec<_>>()
-                })
-            })
-            .collect();
-        hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
+    let slots: Vec<std::sync::Mutex<Option<R>>> = ranges.iter().map(|_| std::sync::Mutex::new(None)).collect();
+    Pool::get().run(ranges.len(), &|i| {
+        let r = f(ranges[i].clone());
+        *slots[i].lock().unwrap() = Some(r);
     });
-    out.sort_by_key(|(i, _)| *i);
-    out.into_iter().map(|(_, r)| r).collect()
+    slots.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect()
+}
+
+#[derive(Clone, Copy)]
+struct SlicePtr(*mut f64);
+unsafe impl Send for SlicePtr {}
+unsafe impl Sync for SlicePtr {}
+impl SlicePtr {
+    fn get(&self) -> *mut f64 {
+        self.0
+    }
 }
 
 /// Apply `f` to disjoint mutable sub-slices of `v` given by `ranges`
 /// (which must tile `0..v.len()` in order), in parallel.
 fn par_chunks_mut(v: &mut [f64], ranges: &[std::ops::Range<usize>], f: impl Fn(&mut [f64], std::ops::Range<usize>) + Sync) {
-    let t = n_threads().min(ranges.len());
-    if t <= 1 {
-        let mut rest = v;
-        let mut offset = 0;
+    if let Some(last) = ranges.last() {
+        assert!(last.end == v.len() && ranges[0].start == 0, "ranges must tile the slice");
+    }
+    if n_threads() <= 1 || ranges.len() <= 1 {
         for r in ranges {
-            let (head, tail) = rest.split_at_mut(r.end - offset);
-            rest = tail;
-            offset = r.end;
-            f(head, r.clone());
+            f(&mut v[r.clone()], r.clone());
         }
         return;
     }
-    let mut pieces: Vec<(&mut [f64], std::ops::Range<usize>)> = Vec::with_capacity(ranges.len());
-    let mut rest = v;
-    let mut offset = 0;
-    for r in ranges {
-        let (head, tail) = rest.split_at_mut(r.end - offset);
-        rest = tail;
-        offset = r.end;
-        pieces.push((head, r.clone()));
-    }
-    let f = &f;
-    std::thread::scope(|sc| {
-        let mut buckets: Vec<Vec<(&mut [f64], std::ops::Range<usize>)>> = (0..t).map(|_| Vec::new()).collect();
-        for (i, p) in pieces.into_iter().enumerate() {
-            buckets[i % t].push(p);
-        }
-        for b in buckets {
-            sc.spawn(move || {
-                for (chunk, r) in b {
-                    f(chunk, r);
-                }
-            });
-        }
+    let base = SlicePtr(v.as_mut_ptr());
+    Pool::get().run(ranges.len(), &|i| {
+        let r = ranges[i].clone();
+        // Safe: ranges are disjoint, so each task owns its sub-slice.
+        let chunk = unsafe { std::slice::from_raw_parts_mut(base.get().add(r.start), r.len()) };
+        f(chunk, r);
     });
 }
 
@@ -375,6 +479,8 @@ struct Plan<'a> {
     m_groups: Vec<Vec<usize>>,
     /// Intermediate-table hierarchy.
     hier: Hier<'a>,
+    /// Number of messages each junction-tree clique receives.
+    degree: Vec<usize>,
 }
 
 /// A hierarchy of intermediate tables per junction-tree table. Reading many
@@ -449,6 +555,13 @@ impl<'a> Plan<'a> {
             m_maps: maps(n_m, p.m_map_off, p.m_map, p.m_bk),
             mar_groups: groups(n_j, sl(p.mar_parent, n_l)),
             m_groups: groups(n_l, sl(p.m_l, n_m)),
+            degree: {
+                let mut d = vec![0usize; n_j];
+                for &x in sl(p.e_dst, n_e) {
+                    d[x as usize] += 1;
+                }
+                d
+            },
             hier: {
                 let n_h = p.n_h as usize;
                 let parent = sl(p.h_parent, n_h);
@@ -525,6 +638,12 @@ struct Work {
     mbuf: Vec<f64>,
     /// Intermediate tables of the hierarchy.
     hbuf: Vec<f64>,
+    /// Probability conversion state per junction-tree clique.
+    converted: Vec<bool>,
+    prob_max: Vec<f64>,
+    prob_sum: Vec<f64>,
+    /// Messages received so far per junction-tree clique.
+    received: Vec<usize>,
     messages: Vec<f64>,
     sent: Vec<bool>,
     acc: Vec<f64>,
@@ -543,6 +662,10 @@ impl Work {
             beliefs: vec![0.0; *plan.j_off.last().unwrap() as usize],
             probs: vec![0.0; *plan.j_off.last().unwrap() as usize],
             hbuf: vec![0.0; *plan.hier.off.last().unwrap_or(&0) as usize],
+            converted: vec![false; plan.j_off.len() - 1],
+            prob_max: vec![0.0; plan.j_off.len() - 1],
+            prob_sum: vec![0.0; plan.j_off.len() - 1],
+            received: vec![0; plan.j_off.len() - 1],
             mbuf: vec![
                 0.0;
                 (0..plan.j_off.len() - 1)
@@ -1241,27 +1364,92 @@ fn calibrate(plan: &Plan, w: &mut Work, theta: &[f64], how: Reduce) {
     // junction-tree clique).
     timed("oracle: expand potentials", || expand_potentials(plan, w, theta));
     w.sent.fill(false);
+    w.received.fill(0);
+    w.converted.fill(false);
     for e in 0..plan.e_src.len() {
         let (s, d) = (plan.e_src[e] as usize, plan.e_dst[e] as usize);
         let rev = plan.e_rev[e] as usize;
         let sep = plan.sep_range(e);
-        let (before, after) = w.messages.split_at_mut(sep.start);
-        let msg = &mut after[..sep.len()];
-        let src = &w.beliefs[plan.j_range(s)];
-        // HUGIN division: subtract the message previously received from d
-        // (same separator, so it is indexed by the same map).
-        let sub = if w.sent[rev] {
-            let r = plan.sep_range(rev);
-            debug_assert!(r.end <= sep.start);
-            Some(&before[r])
-        } else {
-            None
-        };
-        let acc = &mut w.acc;
-        timed("oracle: message reduce", || project(src, sub, plan.src_maps[e], msg, acc, how));
+        // A clique that has received all its incoming messages is
+        // calibrated: its beliefs no longer change, so convert it to
+        // probabilities once and send every further message from those.
+        let calibrated = how == Reduce::LogSumExp && w.received[s] == plan.degree[s];
+        if calibrated && !w.converted[s] {
+            convert_to_probs(plan, w, s);
+        }
+        let mut done = false;
+        if calibrated {
+            done = timed("oracle: message from probabilities", || message_from_probs(plan, w, e, s, rev));
+        }
+        if !done {
+            let (before, after) = w.messages.split_at_mut(sep.start);
+            let msg = &mut after[..sep.len()];
+            let src = &w.beliefs[plan.j_range(s)];
+            // HUGIN division: subtract the message previously received from
+            // d (same separator, so it is indexed by the same map).
+            let sub = if w.sent[rev] {
+                let r = plan.sep_range(rev);
+                debug_assert!(r.end <= sep.start);
+                Some(&before[r])
+            } else {
+                None
+            };
+            let acc = &mut w.acc;
+            timed("oracle: message reduce", || project(src, sub, plan.src_maps[e], msg, acc, how));
+        }
+        let msg = &w.messages[sep];
         timed("oracle: message broadcast", || broadcast_add_par(&mut w.beliefs[plan.j_range(d)], plan.dst_maps[e], msg));
         w.sent[e] = true;
+        w.received[d] += 1;
     }
+}
+
+/// `probs[j] = exp(b_j - max(b_j))`, recording the max and the sum.
+#[inline(always)]
+fn convert_to_probs(plan: &Plan, w: &mut Work, j: usize) {
+    let jr = plan.j_range(j);
+    let b = &w.beliefs[jr.clone()];
+    let m = timed("marginals: max", || vmax_par(b));
+    let p = &mut w.probs[jr];
+    let sum = timed("marginals: exp", || exp_sum_par(b, m, p));
+    w.prob_max[j] = m;
+    w.prob_sum[j] = sum;
+    w.converted[j] = true;
+}
+
+/// Message `e` from calibrated clique `s`, computed from its probabilities:
+/// `log sum_{cells of o} exp(b - rev[o]) = max_s + ln S[o] - rev[o]`, with
+/// `S[o]` the plain sum of `probs = exp(b - max_s)` over the cells mapping
+/// to separator cell `o` (no exp per cell). Returns false (leaving the
+/// message to the exact log-space path) if some `S[o]` underflows, which
+/// happens only when all of `o`'s cells are ~700 below the clique's max.
+#[inline(always)]
+fn message_from_probs(plan: &Plan, w: &mut Work, e: usize, s: usize, rev: usize) -> bool {
+    let sep = plan.sep_range(e);
+    let n = sep.len();
+    let p = &w.probs[plan.j_range(s)];
+    let buf = &mut w.acc[..n];
+    fused_scatter_sum(p, &[plan.src_maps[e]], &[0, n], buf);
+    if buf.iter().any(|&x| !(x > 1e-280) || !x.is_finite()) {
+        return false;
+    }
+    let m = w.prob_max[s];
+    let (before, after) = w.messages.split_at_mut(sep.start);
+    let msg = &mut after[..n];
+    if w.sent[rev] {
+        let r = &before[plan.sep_range(rev)];
+        if r.iter().any(|x| !x.is_finite()) {
+            return false;
+        }
+        for ((o, &x), &rv) in msg.iter_mut().zip(buf.iter()).zip(r) {
+            *o = m + x.ln() - rv;
+        }
+    } else {
+        for (o, &x) in msg.iter_mut().zip(buf.iter()) {
+            *o = m + x.ln();
+        }
+    }
+    true
 }
 
 /// Marginals over the loss cliques, normalized to `total` (mirrors
@@ -1280,14 +1468,12 @@ fn marginals(plan: &Plan, w: &mut Work, theta: &[f64], total: f64, mu: &mut [f64
         }
         // probs = exp(b - max(b)) in one pass (also summing it); the
         // normalization total / sum is applied to the (small) outputs.
-        // Equivalent to exp(b - logsumexp(b) + log(total)) up to rounding,
-        // with one exp per cell instead of two.
-        let jr = plan.j_range(j);
-        let b = &w.beliefs[jr.clone()];
-        let m = timed("marginals: max", || vmax_par(b));
-        let p = &mut w.probs[jr];
-        let sum = timed("marginals: exp", || exp_sum_par(b, m, p));
-        scale[j] = total / sum;
+        // Equivalent to exp(b - logsumexp(b) + log(total)) up to rounding.
+        // Cliques already converted during calibration are reused.
+        if !w.converted[j] {
+            convert_to_probs(plan, w, j);
+        }
+        scale[j] = total / w.prob_sum[j];
     }
     timed("marginals: read out loss cliques", || read_out(plan, w, &scale, mu));
 }
@@ -1519,15 +1705,16 @@ pub unsafe extern "C" fn mbi_mirror_descent(
     iters: u64,
     block: u64,
     tol: f64,
+    loss_rtol: f64,
     info: *mut f64,
 ) -> i32 {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            return md_avx2(plan, theta, mu_out, total, lipschitz, alpha0, stepsize, iters, block, tol, info);
+            return md_avx2(plan, theta, mu_out, total, lipschitz, alpha0, stepsize, iters, block, tol, loss_rtol, info);
         }
     }
-    md_impl(plan, theta, mu_out, total, lipschitz, alpha0, stepsize, iters, block, tol, info)
+    md_impl(plan, theta, mu_out, total, lipschitz, alpha0, stepsize, iters, block, tol, loss_rtol, info)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1535,16 +1722,16 @@ pub unsafe extern "C" fn mbi_mirror_descent(
 #[allow(clippy::too_many_arguments)]
 unsafe fn md_avx2(
     plan: *const PlanC, theta: *mut f64, mu_out: *mut f64, total: f64, lipschitz: f64,
-    alpha0: f64, stepsize: f64, iters: u64, block: u64, tol: f64, info: *mut f64,
+    alpha0: f64, stepsize: f64, iters: u64, block: u64, tol: f64, loss_rtol: f64, info: *mut f64,
 ) -> i32 {
-    md_impl(plan, theta, mu_out, total, lipschitz, alpha0, stepsize, iters, block, tol, info)
+    md_impl(plan, theta, mu_out, total, lipschitz, alpha0, stepsize, iters, block, tol, loss_rtol, info)
 }
 
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 unsafe fn md_impl(
     plan: *const PlanC, theta: *mut f64, mu_out: *mut f64, total: f64, lipschitz: f64,
-    alpha0: f64, stepsize: f64, iters: u64, block: u64, tol: f64, info: *mut f64,
+    alpha0: f64, stepsize: f64, iters: u64, block: u64, tol: f64, loss_rtol: f64, info: *mut f64,
 ) -> i32 {
     let plan = Plan::new(&*plan);
     let n = plan.n_cells();
@@ -1562,6 +1749,8 @@ unsafe fn md_impl(
     let mut neg = vec![0.0; n];
     let mut state_mu = vec![0.0; n]; // `state.mu`: marginals at the start of the last step
     let mut theta_cur = theta.to_vec();
+    let mut prev_block_loss = f64::INFINITY;
+    let mut start_loss = f64::INFINITY;
 
     marginals(&plan, &mut w, &theta_cur, total, &mut mu);
     let mut loss_acc = loss_and_grad(&plan, &mut w, &mu, None);
@@ -1576,6 +1765,9 @@ unsafe fn md_impl(
             // mu == marginals(theta) is maintained across steps, so the oracle
             // call at the start of MirrorDescent._step is not repeated.
             let loss = loss_and_grad(&plan, &mut w, &mu, Some(&mut grad));
+            // Loss at `state.mu` (marginals at the start of this step), the
+            // value Estimator.estimate checks for loss_rtol.
+            start_loss = loss;
             {
                 let (th, g) = (&theta_cur, &grad);
                 let ranges = split(n, 1);
@@ -1618,6 +1810,12 @@ unsafe fn md_impl(
                 break;
             }
             prev_gap = gap;
+        }
+        if loss_rtol >= 0.0 {
+            if prev_block_loss - start_loss <= loss_rtol * start_loss.abs() {
+                break;
+            }
+            prev_block_loss = start_loss;
         }
     }
     mu_out.copy_from_slice(&mu);
@@ -1868,15 +2066,16 @@ pub unsafe extern "C" fn mbi_accelerated(
     tol: f64,
     max_iter_search: u64,
     target_acc: f64,
+    loss_rtol: f64,
     info: *mut f64,
 ) -> i32 {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            return accel_avx2(plan, theta, mu_out, x_out, total, lipschitz, iters, block, tol, max_iter_search, target_acc, info);
+            return accel_avx2(plan, theta, mu_out, x_out, total, lipschitz, iters, block, tol, max_iter_search, target_acc, loss_rtol, info);
         }
     }
-    accel_impl(plan, theta, mu_out, x_out, total, lipschitz, iters, block, tol, max_iter_search, target_acc, info)
+    accel_impl(plan, theta, mu_out, x_out, total, lipschitz, iters, block, tol, max_iter_search, target_acc, loss_rtol, info)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1884,16 +2083,16 @@ pub unsafe extern "C" fn mbi_accelerated(
 #[allow(clippy::too_many_arguments)]
 unsafe fn accel_avx2(
     plan: *const PlanC, theta: *mut f64, mu_out: *mut f64, x_out: *mut f64, total: f64, lipschitz: f64,
-    iters: u64, block: u64, tol: f64, max_iter_search: u64, target_acc: f64, info: *mut f64,
+    iters: u64, block: u64, tol: f64, max_iter_search: u64, target_acc: f64, loss_rtol: f64, info: *mut f64,
 ) -> i32 {
-    accel_impl(plan, theta, mu_out, x_out, total, lipschitz, iters, block, tol, max_iter_search, target_acc, info)
+    accel_impl(plan, theta, mu_out, x_out, total, lipschitz, iters, block, tol, max_iter_search, target_acc, loss_rtol, info)
 }
 
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 unsafe fn accel_impl(
     plan: *const PlanC, theta: *mut f64, mu_out: *mut f64, x_out: *mut f64, total: f64, lipschitz: f64,
-    iters: u64, block: u64, tol: f64, max_iter_search: u64, target_acc: f64, info: *mut f64,
+    iters: u64, block: u64, tol: f64, max_iter_search: u64, target_acc: f64, loss_rtol: f64, info: *mut f64,
 ) -> i32 {
     let plan = Plan::new(&*plan);
     let n = plan.n_cells();
@@ -1915,6 +2114,8 @@ unsafe fn accel_impl(
     let mut stepsize = 1.0 / (total * total * lipschitz);
     let mut prev_stepsize = stepsize;
     let mut prev_theta = -1.0f64;
+    let mut x_loss = f64::INFINITY; // f(x) at the last accepted step
+    let mut prev_block_loss = f64::INFINITY;
 
     let blocks = (iters + block - 1) / block.max(1);
     let mut steps = 0u64;
@@ -1965,6 +2166,7 @@ unsafe fn accel_impl(
                 let tol_eps = 5e3 * f64::EPSILON * value_y.abs() + 1e-12;
                 let accept = new_value <= taylor + 0.5 * target_acc * th + tol_eps;
                 if accept {
+                    x_loss = new_value;
                     std::mem::swap(&mut x, &mut x2);
                     std::mem::swap(&mut z, &mut z2);
                     std::mem::swap(&mut u, &mut u2);
@@ -1992,6 +2194,12 @@ unsafe fn accel_impl(
                 break;
             }
             prev_gap = gap;
+        }
+        if loss_rtol >= 0.0 {
+            if prev_block_loss - x_loss <= loss_rtol * x_loss.abs() {
+                break;
+            }
+            prev_block_loss = x_loss;
         }
     }
     for k in 0..n {

@@ -138,12 +138,13 @@ def _load():
   lib.mbi_oracle.argtypes = [_P(_PlanC), _P(dbl), dbl, u32, _P(dbl)]
   lib.mbi_oracle.restype = ctypes.c_int32
   lib.mbi_mirror_descent.argtypes = [
-      _P(_PlanC), _P(dbl), _P(dbl), dbl, dbl, dbl, dbl, u64, u64, dbl, _P(dbl)
+      _P(_PlanC), _P(dbl), _P(dbl), dbl, dbl, dbl, dbl, u64, u64, dbl, dbl,
+      _P(dbl),
   ]
   lib.mbi_mirror_descent.restype = ctypes.c_int32
   lib.mbi_accelerated.argtypes = [
       _P(_PlanC), _P(dbl), _P(dbl), _P(dbl), dbl, dbl, u64, u64, dbl, u64,
-      dbl, _P(dbl),
+      dbl, dbl, _P(dbl),
   ]
   lib.mbi_accelerated.restype = ctypes.c_int32
   lib.mbi_count.argtypes = [
@@ -291,6 +292,23 @@ def _build_hierarchy(domain, attrs, parent, j, leaves, nodes, attach):
     attach[i] = parent
 
 
+def _rooted_schedule(tree: nx.Graph, root) -> list:
+  """Messages (u, v) for a collect (post-order, towards ``root``) then
+  distribute (pre-order, away from it) pass over a tree."""
+  parent, preorder = {root: None}, []
+  stack = [root]
+  while stack:
+    u = stack.pop()
+    preorder.append(u)
+    for v in sorted(tree.neighbors(u), key=str):
+      if v not in parent:
+        parent[v] = u
+        stack.append(v)
+  collect = [(u, parent[u]) for u in reversed(preorder) if parent[u] is not None]
+  distribute = [(parent[u], u) for u in preorder if parent[u] is not None]
+  return collect + distribute
+
+
 @functools.lru_cache(maxsize=64)
 def _structure(
     domain: Domain, loss_cliques: tuple, measurement_cliques: tuple
@@ -305,9 +323,16 @@ def _structure(
   position = {a: i for i, a in enumerate(domain.attributes)}
   layout_key = lambda a: (domain[a], position[a])
   layout = {c: tuple(sorted(c, key=layout_key)) for c in maximal}
-  order = [(layout[i], layout[j]) for i, j in order]
   maximal = [layout[c] for c in maximal]
   jtree = nx.relabel_nodes(jtree, layout)
+  # HUGIN schedule rooted at the largest clique: collect towards it, then
+  # distribute from it. Any valid schedule gives the same calibration (up to
+  # rounding); rooting at the largest clique means it sends all of its
+  # messages after it is calibrated, so the native kernels compute them from
+  # its probability table (shared with the marginals) without an extra exp
+  # pass over it.
+  del order
+  order = _rooted_schedule(jtree, max(maximal, key=domain.size))
   jindex = {c: i for i, c in enumerate(maximal)}
 
   rev = reverse_clique_mapping(maximal, loss_cliques, domain=domain)
@@ -846,6 +871,7 @@ class NativeMirrorDescent(estimation.MirrorDescent):
         * estimation.CALLBACK_EVERY,
         estimation.CALLBACK_EVERY,
         float(tol) if tol is not None else -1.0,
+        float(self.loss_rtol) if self.loss_rtol is not None else -1.0,
         info.ctypes.data_as(_P(dbl)),
     )
     if status != 0:
@@ -989,6 +1015,7 @@ class NativeAcceleratedMethod(estimation.UniversalAcceleratedMethod):
         float(tol) if tol is not None else -1.0,
         int(self.max_iter_search),
         float(self.target_acc),
+        float(self.loss_rtol) if self.loss_rtol is not None else -1.0,
         info.ctypes.data_as(_P(dbl)),
     )
     if status != 0:

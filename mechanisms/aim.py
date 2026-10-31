@@ -250,6 +250,7 @@ class AIM(Mechanism):
         intermediate_iters=None,
         use_native=None,
         estimator="mirror_descent",
+        loss_rtol=None,
     ):
         """
         :param fuse_steps: passed to ``MirrorDescent``.  ``False`` (default)
@@ -283,6 +284,9 @@ class AIM(Mechanism):
             accelerated method fits the same models but converges much faster
             on large datasets, where mirror descent typically stops at
             ``max_iters`` far from convergence; see benchmarks/aim/REPORT.md.
+        :param loss_rtol: optional early stopping for each fit: stop when a
+            block of 50 iterations improves the loss by at most this fraction
+            (see ``Estimator.loss_rtol``).  ``None`` (default) disables it.
         """
         super(AIM, self).__init__(
             epsilon, delta, bounded=False, prng=prng or np.random
@@ -309,6 +313,7 @@ class AIM(Mechanism):
         if estimator not in ("mirror_descent", "accelerated"):
             raise ValueError(f"Unknown estimator {estimator!r}")
         self.estimator = estimator
+        self.loss_rtol = loss_rtol
 
     def _estimate(self, domain, measurements, warm_start=None, iters=None):
         cliques = list({m.clique for m in measurements})
@@ -320,7 +325,7 @@ class AIM(Mechanism):
                 if self.use_native
                 else estimation.UniversalAcceleratedMethod
             )
-            return cls().estimate(
+            return cls(loss_rtol=self.loss_rtol).estimate(
                 domain,
                 merge_measurements(measurements),
                 iters=iters or self.max_iters,
@@ -335,6 +340,7 @@ class AIM(Mechanism):
             fuse_steps=self.fuse_steps,
             fast_compile=cells <= self.fast_compile_max_cells,
             parallel_compile=self.parallel_compile,
+            loss_rtol=self.loss_rtol,
         )
         return estimator.estimate(
             domain,

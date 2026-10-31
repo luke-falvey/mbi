@@ -101,6 +101,8 @@ def primal_dual_gap(
 _jitted_primal_dual_gap = jax.jit(
     primal_dual_gap, static_argnames=("marginal_oracle", "normalize")
 )
+_jitted_loss = jax.jit(lambda loss_fn, mu: loss_fn(mu))
+
 # XLA option that skips backend (LLVM) optimization passes.
 _FAST_COMPILE_OPTIONS = {"xla_backend_optimization_level": 0}
 _jitted_primal_dual_gap_fast = jax.jit(
@@ -152,6 +154,12 @@ class Estimator(ABC):
           disabled. Compilation is ~1.5-2.5x faster but each step runs ~2-3x
           slower, so this only pays off for small models where compile time
           dominates. Defaults to ``False``.
+      loss_rtol: Optional early stopping on the loss: after each block of
+          ``CALLBACK_EVERY`` steps, stop if the loss (at the callback value)
+          improved by at most ``loss_rtol`` times its magnitude since the
+          previous block. ``None`` (default) disables it. Useful on large,
+          badly conditioned problems, where the loss stops improving long
+          before the normalized primal-dual gap reaches ``tol``.
       parallel_compile: If ``True``, ``estimate`` compiles the optimization
           step and the convergence check on background threads while the
           estimator initializes, so the independent XLA compilations run
@@ -170,6 +178,7 @@ class Estimator(ABC):
   fuse_steps: bool = True
   fast_compile: bool = False
   parallel_compile: bool = False
+  loss_rtol: float | None = None
 
   # ------------------------------------------------------------------
   # Abstract interface — subclasses must implement
@@ -321,6 +330,7 @@ class Estimator(ABC):
       except Exception:  # pylint: disable=broad-exception-caught
         pass
     prev_gap = np.inf
+    prev_loss = np.inf
     for _ in range(math.ceil(iters / CALLBACK_EVERY)):
       state = self._run_block(state, loss_fn, known_total, constraints)
       mu = self._callback_value(state, known_total, constraints)
@@ -335,6 +345,13 @@ class Estimator(ABC):
         if gap <= tol or gap == prev_gap:
           break
         prev_gap = float(gap)
+      if self.loss_rtol is not None:
+        if not isinstance(mu, CliqueVector):
+          mu = CliqueVector.from_projectable(mu, loss_fn.cliques)
+        loss = float(_jitted_loss(loss_fn, mu))
+        if prev_loss - loss <= self.loss_rtol * abs(loss):
+          break
+        prev_loss = loss
     return self._finalize(state, known_total, constraints=constraints)
 
   def _compile_in_background(

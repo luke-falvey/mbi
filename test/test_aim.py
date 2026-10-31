@@ -446,6 +446,17 @@ class TestAIMAcceleratedEstimator(unittest.TestCase):
         1.5 * self._tv(data, md.model, workload) + 0.01,
     )
 
+  def test_loss_rtol(self):
+    data = _dataset(rows=5000, seed=11)
+    workload = [(cl, 1.0) for cl in itertools.combinations(data.domain, 2)]
+    run = _run(aim.AIM, data, workload, estimator="accelerated",
+               loss_rtol=1e-2)
+    md = _run(aim.AIM, data, workload)
+    self.assertLess(
+        self._tv(data, run.model, workload),
+        1.5 * self._tv(data, md.model, workload) + 0.01,
+    )
+
   def test_unknown_estimator(self):
     with self.assertRaises(ValueError):
       aim.AIM(1.0, 1e-9, estimator="newton")

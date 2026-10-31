@@ -463,6 +463,94 @@ class TestSampleColumn(unittest.TestCase):
       self.assertEqual(s1.data[a].dtype, np.min_scalar_type(domain[a]))
 
 
+@unittest.skipUnless(native.is_available(), "mbi native library not built")
+class TestLossRtol(unittest.TestCase):
+
+  def test_native_stops_at_same_block_as_jax(self):
+    domain, cliques = _MODELS["chain_with_loop"]
+    with _x64():
+      meas = _measurements(domain, cliques, seed=12)
+      for r in (1e-1, 1e-3):
+        kw = dict(stepsize=1e-4, loss_rtol=r)
+        expected = estimation.MirrorDescent(**kw).estimate(
+            domain, meas, iters=1000, tol=None
+        )
+        actual = native.NativeMirrorDescent(**kw).estimate(
+            domain, meas, iters=1000, tol=None
+        )
+        # Fixed step: identical iterates, so agreement means both stopped
+        # after the same block.
+        self.assertLess(
+            _max_diff(expected.marginals, actual.marginals, expected.cliques),
+            1e-9 * float(expected.total), r,
+        )
+
+  def test_jax_estimator_stops_early(self):
+    domain, cliques = _MODELS["chain_with_loop"]
+    meas = _measurements(domain, cliques, seed=13)
+    calls = []
+    estimation.MirrorDescent(loss_rtol=10.0).estimate(
+        domain, meas, iters=1000, tol=None, callback_fn=calls.append
+    )
+    # The first block can't be compared with anything; the second always
+    # satisfies a loose threshold.
+    self.assertEqual(len(calls), 2)
+
+
+@unittest.skipUnless(native.is_available(), "mbi native library not built")
+class TestMessagesFromProbabilities(unittest.TestCase):
+
+  def test_extreme_ranges_fall_back_exactly(self):
+    # A separator slice ~2000 below the clique's max: its probabilities
+    # underflow, so the message must take the exact log-space path.
+    domain = Domain(list("abc"), [3, 4, 2])
+    cliques = [("a", "b"), ("b", "c")]
+    with _x64():
+      np.random.seed(14)
+      pot = CliqueVector.random(domain, cliques)
+      ab = np.asarray(pot[("a", "b")].values).copy()
+      ab[:, 0] -= 2000.0
+      pot[("a", "b")] = Factor(domain.project(("a", "b")), jax.numpy.asarray(ab))
+      bc = np.asarray(pot[("b", "c")].values).copy()
+      bc[0, :] += 1990.0
+      pot[("b", "c")] = Factor(domain.project(("b", "c")), jax.numpy.asarray(bc))
+      expected = marginal_oracles.message_passing_hugin(pot, 1.0)
+      actual = native.oracle(pot, 1.0)
+      for cl in cliques:
+        np.testing.assert_allclose(
+            np.asarray(actual[cl].values), np.asarray(expected[cl].values),
+            rtol=1e-8, atol=1e-12,
+        )
+
+
+@unittest.skipUnless(native.is_available(), "mbi native library not built")
+class TestThreadCountIndependence(unittest.TestCase):
+
+  def test_same_results_with_1_and_4_threads(self):
+    import subprocess  # pylint: disable=import-outside-toplevel
+    script = (
+        "import numpy as np, sys\n"
+        "from mbi import Domain, Factor, LinearMeasurement, native\n"
+        "rng = np.random.default_rng(0)\n"
+        "dom = Domain([f'v{i}' for i in range(7)], [16]*7)\n"
+        "cl = [('v0','v1','v2','v3','v4'), ('v3','v4','v5','v6'), ('v1',), ('v6',)]\n"
+        "meas = [LinearMeasurement(rng.random(dom.size(c))*100, c, stddev=3.0) for c in cl]\n"
+        "m = native.NativeAcceleratedMethod().estimate(dom, meas, iters=50, tol=None)\n"
+        "np.save(sys.argv[1], np.concatenate([np.asarray(m.marginals[c].values, dtype=np.float64).ravel() for c in m.cliques]))\n"
+    )
+    import os, tempfile  # pylint: disable=import-outside-toplevel,multiple-imports
+    outs = []
+    with tempfile.TemporaryDirectory() as d:
+      for t in ("1", "4"):
+        path = os.path.join(d, f"out{t}.npy")
+        env = dict(os.environ, MBI_NATIVE_THREADS=t, JAX_ENABLE_X64="1",
+                   PYTHONWARNINGS="ignore")
+        subprocess.run([sys.executable, "-c", script, path], env=env,
+                       check=True, capture_output=True)
+        outs.append(np.load(path))
+    np.testing.assert_array_equal(outs[0], outs[1])
+
+
 class TestWithoutLibrary(unittest.TestCase):
   """Without the native library everything falls back to the JAX code."""
 
