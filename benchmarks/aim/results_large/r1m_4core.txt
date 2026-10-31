@@ -1,0 +1,2 @@
+seed=0 rows=1000000 cols=8 est=mirror_descent iters=1000: 745.2s  model TV=0.0019  synth TV=0.0027
+seed=0 rows=1000000 cols=8 est=accelerated iters=200: 178.7s  model TV=0.0018  synth TV=0.0027

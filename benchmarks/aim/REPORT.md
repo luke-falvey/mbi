@@ -2,6 +2,16 @@
 
 ## TL;DR
 
+> **Update 3: large datasets** (see [section 7](#7-large-datasets)).
+> At 1M+ rows the bottleneck was algorithmic: mirror descent doesn't
+> converge on AIM's large, badly conditioned late-round fits, so every fit
+> ran the full 1,000 iterations. A native accelerated optimizer
+> (`AIM(estimator="accelerated")`) reaches the same fit quality in about 10×
+> fewer iterations, and new kernel work makes each iteration on
+> multi-million-cell models about 2× cheaper. 1M rows × 8 columns:
+> **28.5 min → 3.0 min** on 4 cores (12.4 min with the default estimator),
+> with equal or better fit quality.
+>
 > **Update 2: native (Rust) backend** (see [section 6](#6-native-rust-backend)).
 > With the optional Rust library, AIM runs **70–500× faster than the
 > original** on every configuration benchmarked, single core. The 8-column run
@@ -544,6 +554,136 @@ engine, and the JAX paths are unchanged and still the default for
 * Port more estimators (e.g. `UniversalAcceleratedMethod`) and Shafer-Shenoy
   (for constraints) to the native path.
 
+
+## 7. Large datasets
+
+### Diagnosis
+
+At 1M rows the native backend spent 99% of its time in fitting (no
+compilation, almost no Python). Reconstructing the late-round fits of the
+1M-row run offline showed why:
+
+* **The models are huge.** AIM's size limit grows as the privacy budget is
+  spent, and with strong signal it keeps adding cliques. By round 36 the
+  junction tree has 4.4M cells (one clique of 4.2M), and by round 46 it has
+  8.4M, close to the 80 MB cap.
+* **Mirror descent doesn't converge on them.** With counts in the hundreds
+  of thousands and noise σ ≈ 5, the problem is badly conditioned. Every
+  late fit ran all 1,000 iterations and ended with a normalized gap of about
+  0.67, against the 1e-3 tolerance. The loss was still falling steeply
+  (cold start: 4.4e5 at 1,000 iterations, 2.7e4 at 3,000). The step size
+  isn't the limit: Armijo grows it 5–7× and then plateaus.
+
+So most of the cost was iterations, not per-iteration speed.
+
+### 1. A faster optimizer
+
+All of mbi's estimators, compared on a reconstructed 1M-row fit (57k cells,
+float64; loss after N iterations, lower is better):
+
+| Estimator | cold 100 / 300 / 1000 | warm 100 / 300 / 1000 |
+|---|---|---|
+| MirrorDescent (AIM's default) | 1.2e8 / 7.6e6 / 4.4e5 | 6.8e5 / 2.0e5 / 6.1e4 |
+| **UniversalAcceleratedMethod** | 6.6e5 / 1.4e4 / **590** | 6.2e4 / 2.2e3 / **295** |
+| LBFGS | 9.9e7 / 2.3e7 / 3.9e6 | 5.4e5 / 3.4e5 / 2.0e5 |
+| DualAveraging | 1.8e7 / 4.7e5 / 8.7e3 | 1.8e7 / 4.7e5 / 8.3e3 |
+| InteriorGradient | 1.7e7 / 4.5e5 / 8.2e3 | 2.6e5 / 4.1e4 / 1.1e3 |
+
+The accelerated method (Nesterov's universal method) reaches in 100 warm
+iterations the loss mirror descent reaches in 1,000. It exists in mbi, but
+only in JAX, where it compiles per structure and finishes with an L-BFGS
+projection of up to 25,000 iterations. So it was ported:
+
+* **`mbi.native.NativeAcceleratedMethod`** runs the method's loop
+  (including the backtracking line search) in Rust. Its averaged iterate
+  matches JAX's to 1e-6 in float64 (`test_native.py`), and it runs 10–100×
+  faster than the JAX version.
+* **The final model differs from JAX's.** The averaged iterate `x` isn't
+  itself a graphical model, so instead of an expensive L-BFGS projection the
+  native version returns the model given by the dual potentials (marginals =
+  the mirror iterate `z`). A short mirror-descent projection onto `x` barely
+  helped (same conditioning problem). The `z` model is still far better than
+  mirror descent's at equal iterations: 1,465 against 61,330 after 1,000
+  iterations on the problem above.
+* **AIM gets `estimator="accelerated"`** (opt-in; the default stays mirror
+  descent, as in the AIM paper).
+
+AIM end to end with `estimator="accelerated", max_iters=200` against the
+default (mirror descent, 1,000 iterations), native backend:
+
+| Data | Mirror descent, 1000 iters | Accelerated, 200 iters |
+|---|---|---|
+| 100k × 8, 3 seeds | 3.3–4.6s, model TV 0.0142 / 0.0142 / 0.0142 | **1.3–1.7s**, TV 0.0141 / 0.0146 / 0.0136 |
+| 100k × 12, 3 seeds | 30–51s, TV 0.0166 / 0.0163 / 0.0172 | **11–13s**, TV 0.0169 / 0.0170 / 0.0170 |
+| **1M × 8, 4 cores** | **745s** (was 1,709s before this section's kernel work), TV 0.0019 | **179s** (3.0 min), TV 0.0018 |
+
+TV is the mean total-variation error of the model's 2-way marginals against
+the data (lower is better). Quality is the same within run-to-run noise;
+with only 200 iterations, mirror descent is visibly worse (TV 0.0147 at
+100k × 8). Recommendation: use `estimator="accelerated"` with `max_iters`
+around 200 for datasets of 100k rows or more.
+
+### 2. Cheaper iterations on huge models
+
+A new opt-in profiler (`MBI_NATIVE_PROFILE=1`) breaks fits down by phase. On
+the 4.4M-cell fit, half the time went into moving data between the 26
+*small* loss cliques (3,716 cells in total) and the huge junction-tree
+tables. Fixes:
+
+* **Intermediate-table hierarchy.** Python plans, per junction-tree table, a
+  greedy hierarchy of intermediate tables: drop an attribute whenever enough
+  small cliques fit in the smaller table to pay for the extra pass. Marginals
+  are read from the smallest table containing them, and potentials are
+  summed into intermediates before being broadcast into the big table. For
+  the 4.2M-cell table this is two 262k-cell intermediates.
+* **One `exp` pass for normalization.** Probabilities are computed as
+  `exp(b − max)` while summing (in parallel), and `total/sum` is applied to
+  the small outputs. The old serial log-sum-exp pass is gone, along with a
+  second `exp` pass.
+* **Disjoint parallel scatters.** When a reduction keeps the big table's
+  leading attribute(s), splitting along them gives each part its own output
+  range. Parts write directly into their own sub-slices, with no per-part
+  partial buffers. This applies to marginal read-out and message reduction.
+
+| Phase (100 accelerated iterations, 4.4M cells) | before, 1 / 4 threads | after, 1 / 4 threads |
+|---|---|---|
+| Expand potentials | 4.1s / 2.1s | **1.0s / 0.8s** |
+| Read out loss-clique marginals | 4.2s / 2.2s | **1.0s / 0.8s** |
+| Normalization (log-sum-exp + `exp`) | 3.8s / 3.2s | **2.6s / 1.4s** |
+| Message reduction | 3.1s / 1.9s | 3.0s / 1.6s |
+| **Wall time** | **20.3s / 10.3s** | **8.7s / 5.7s** |
+
+### 3. Data-size-dependent steps
+
+* **Counting.** `native.marginal_counts` builds many contingency tables in
+  one multi-threaded pass over compact columns. With 88 cliques at 1M rows
+  it takes 0.14s against 0.93s, and the counts are exact. (`Dataset.project`
+  returns float32, so it can't represent counts above 2^24 exactly.) AIM also
+  reuses its initial counts for each round's measurement instead of
+  re-scanning the data.
+* **Synthetic data.** With `synthetic_data(use_native=True)`, each column is
+  sampled natively: rows are grouped with a counting sort, ranks are
+  shuffled per group, and values come from a binary search in the
+  conditional CDF. Random streams are derived from a seed drawn from
+  `np.random`, per group, so results are reproducible and independent of the
+  thread count. **10M rows: 1.7s against 19.7s**, with the same fidelity to
+  the model.
+
+### What's next for large data
+
+* **Messages from probabilities.** Message reduction is now the largest
+  phase, and it pays one `exp` per cell of the big table. A calibrated clique
+  could send its later messages from its probability table (already computed
+  for the marginals), halving the `exp` work. This needs care with
+  underflow (HUGIN division of −∞).
+* **A better stopping rule.** At large scale the normalized gap plateaus
+  around 1e-2 while the loss has long stopped improving, so even the
+  accelerated method runs to `max_iters`. A relative-loss-improvement
+  criterion would stop earlier, but changes results, so it would be opt-in.
+* **A persistent thread pool,** so tables below 1M cells and independent
+  messages run in parallel (threads give only ~1.5–2× on 4 cores today).
+* **float32 kernels** (half the memory traffic) as an option, and the JAX
+  path on a GPU for the very largest models.
 
 ## Reproducing
 
