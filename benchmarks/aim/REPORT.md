@@ -2,6 +2,11 @@
 
 ## TL;DR
 
+> **Update 4: further large-data work** (see [section 8](#8-further-large-data-optimizations)).
+> 1M rows × 8 columns now takes **91s** on 4 cores (accelerated estimator
+> with the new `loss_rtol` stopping rule), against 1,709s before section 7.
+> The default configuration takes 471s. 10M rows takes 90s.
+>
 > **Update 3: large datasets** (see [section 7](#7-large-datasets)).
 > At 1M+ rows the bottleneck was algorithmic: mirror descent doesn't
 > converge on AIM's large, badly conditioned late-round fits, so every fit
@@ -672,19 +677,54 @@ tables. Fixes:
 
 ### What's next for large data
 
-* **Messages from probabilities.** Message reduction is now the largest
-  phase, and it pays one `exp` per cell of the big table. A calibrated clique
-  could send its later messages from its probability table (already computed
-  for the marginals), halving the `exp` work. This needs care with
-  underflow (HUGIN division of −∞).
-* **A better stopping rule.** At large scale the normalized gap plateaus
-  around 1e-2 while the loss has long stopped improving, so even the
-  accelerated method runs to `max_iters`. A relative-loss-improvement
-  criterion would stop earlier, but changes results, so it would be opt-in.
-* **A persistent thread pool,** so tables below 1M cells and independent
-  messages run in parallel (threads give only ~1.5–2× on 4 cores today).
-* **float32 kernels** (half the memory traffic) as an option, and the JAX
-  path on a GPU for the very largest models.
+See section 8 for what was done next.
+
+## 8. Further large-data optimizations
+
+### What was done
+
+| Change | Effect |
+|---|---|
+| **Opt-in `loss_rtol` stopping rule** (`Estimator.loss_rtol`, JAX and native; `AIM(loss_rtol=...)`): stop when a 50-step block improves the loss by at most this fraction. | Fits stop when the loss plateaus, instead of waiting for a gap criterion that at large scale stays around 1e-2. 100k × 12: mirror descent 34.9s → 15.7s at `1e-3`; accelerated 9.5s (fixed 200 iterations) → 6.7s at `1e-2`, with the same TV error. Native and JAX stop at the same block (tested). |
+| **Messages from probabilities.** A calibrated clique's message is `max + ln S[o] − rev[o]`, where `S` is a plain sum of its probability table (computed anyway for the marginals), so there's no `exp` per cell. The HUGIN schedule is rooted at the largest clique so it sends only calibrated messages. If a separator sum underflows, that message falls back to the exact log-space path (tested with a 2,000-log-unit range). | Message time on the 4.4M-cell fit: 3.0s → 0.7s (1 thread) |
+| **Persistent thread pool.** Workers park on a condition variable instead of being spawned per parallel section. Concurrent or nested use falls back to serial. A race found under stress (a stale worker taking a newer job's task) was fixed with job generations. | 4.4M-cell fit, 4 threads: 5.7s → **2.8s**. Results are bit-identical with 1 and 4 threads (tested in subprocesses). Lowering the parallel threshold below 1M cells made mid-size runs *slower*, so it stays. |
+| **Mixed disjoint/partial read-out.** Read-outs where only some maps keep the big table's leading attribute still split along it: those maps write disjoint sub-slices, and the rest use small partials. | 8.4M-cell fit read-out: 2.1s → 0.7s (4 threads) |
+
+### End-to-end (4 cores, native backend, same fit quality throughout)
+
+| Configuration | Before section 7 | Section 7 | Now |
+|---|---|---|---|
+| 1M × 8, default (mirror descent, 1,000 iters) | 1,709s | 745s | **471s** |
+| 1M × 8, mirror descent + `loss_rtol=1e-3` | – | – | **304s** |
+| 1M × 8, accelerated + `loss_rtol=1e-2` | – | 179s (fixed 200 iters) | **91s** |
+| 10M × 8, accelerated + `loss_rtol=1e-2` | – | 156s (fixed 200 iters) | **90s** |
+
+Model TV error 0.0018–0.0019 at 1M rows and 0.0003 at 10M, synthetic TV
+0.0027 / 0.0004, in every configuration. Raw results:
+`results_large/final_4core.txt`.
+
+**Recommended settings for large datasets:**
+`AIM(..., estimator="accelerated", loss_rtol=1e-2)`. To stay with the
+paper's optimizer, `loss_rtol=1e-3` alone saves about a third.
+
+### Where time goes now, and what was deliberately not done
+
+Per step on the 8.4M-cell fit (4 threads, ~57 ms, ~7 ns per cell), the time
+is spread across converting the two big cliques to probabilities (one `exp`
+pass each, about 25%), expanding potentials (18%), read-out (18%), and the
+one log-space message the non-root big clique must send before it is
+calibrated (21%). That is close to memory bandwidth.
+
+* **float32 kernels: not done.** They might give ~1.5× by halving memory
+  traffic, but would mean making the whole kernel generic over the float
+  type, and would give up the float64 precision that lets these fits
+  converge properly (the effect seen against JAX's float32 path).
+* **Updating probabilities instead of recomputing them** (multiplying by
+  incoming messages): not done. Cells that underflow before a large
+  incoming message would be lost, and handling that correctly costs about
+  what it saves.
+* The remaining levers are hardware: more cores (the pool now scales) or the
+  JAX path on a GPU.
 
 ## Reproducing
 

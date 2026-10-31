@@ -16,6 +16,7 @@ This page documents the history of changes for each version of `mbi`.
     * `out_of_model_marginals`: all pairwise marginals from one calibrated junction tree (one sweep per source attribute) instead of a variable elimination per pair.
     * `hypothetical_model_sizes`, `expand`, `junction_tree_beliefs`, and `MarkovRandomField.synthetic_data(use_native=True)`.
     * AIM uses all of these automatically when the library is available.
+* Large-data performance: `NativeAcceleratedMethod` and `AIM(estimator="accelerated")`; opt-in `Estimator.loss_rtol` / `AIM(loss_rtol=...)` stopping rule; native multi-threaded marginal counting (`native.marginal_counts`) and synthetic-data sampling (`synthetic_data(use_native=True)`); native kernels with an intermediate-table hierarchy, messages computed from probability tables, and a persistent thread pool. 1M-row AIM: 28.5 min → 1.5 min on 4 cores with the recommended settings.
 * `junction_tree.greedy_order` and `junction_tree.hypothetical_model_size` are 7–9x faster with identical results (cached elimination costs; clique sizes computed directly from the elimination instead of building a networkx junction tree).
 
 ## Version 2.0.0 - 09/2026
