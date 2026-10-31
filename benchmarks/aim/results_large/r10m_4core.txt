@@ -1,0 +1,1 @@
+seed=0 rows=10000000 cols=8 est=accelerated iters=200: 155.5s  model TV=0.0003  synth TV=0.0004

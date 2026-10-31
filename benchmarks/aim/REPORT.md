@@ -10,7 +10,7 @@
 > fewer iterations, and new kernel work makes each iteration on
 > multi-million-cell models about 2× cheaper. 1M rows × 8 columns:
 > **28.5 min → 3.0 min** on 4 cores (12.4 min with the default estimator),
-> with equal or better fit quality.
+> with equal or better fit quality. 10M rows × 8 columns takes 2.6 min.
 >
 > **Update 2: native (Rust) backend** (see [section 6](#6-native-rust-backend)).
 > With the optional Rust library, AIM runs **70–500× faster than the
@@ -616,6 +616,7 @@ default (mirror descent, 1,000 iterations), native backend:
 | 100k × 8, 3 seeds | 3.3–4.6s, model TV 0.0142 / 0.0142 / 0.0142 | **1.3–1.7s**, TV 0.0141 / 0.0146 / 0.0136 |
 | 100k × 12, 3 seeds | 30–51s, TV 0.0166 / 0.0163 / 0.0172 | **11–13s**, TV 0.0169 / 0.0170 / 0.0170 |
 | **1M × 8, 4 cores** | **745s** (was 1,709s before this section's kernel work), TV 0.0019 | **179s** (3.0 min), TV 0.0018 |
+| **10M × 8, 4 cores** | – | **156s** (2.6 min), TV 0.0003 |
 
 TV is the mean total-variation error of the model's 2-way marginals against
 the data (lower is better). Quality is the same within run-to-run noise;
