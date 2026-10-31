@@ -113,7 +113,9 @@ class MarkovRandomField:
                 - "sample" for i.i.d sampling
         use_native: Compute the junction-tree marginals with the native
                 library (``mbi.native``) in float64 instead of JAX, which
-                avoids compiling a message-passing program for this model.
+                avoids compiling a message-passing program for this model,
+                and sample each column natively (multi-threaded, with its
+                own random streams seeded from ``np.random``).
                 Ignored if the library is unavailable or the model has
                 constraints. The generated data is statistically equivalent
                 but, because marginals can differ in the last bits, need not
@@ -137,7 +139,10 @@ class MarkovRandomField:
 
     from . import native  # pylint: disable=import-outside-toplevel
 
-    if use_native and not self.constraints and native.is_available():
+    native_sampling = (
+        use_native and not self.constraints and native.is_available()
+    )
+    if native_sampling:
       potentials = native.expand(self.potentials, list(jtree.nodes))
       marginals = native.NumpyMarginals.from_potentials(
           potentials, float(self.total)
@@ -203,6 +208,15 @@ class MarkovRandomField:
             where=marg_parents != 0,
         )
         cond_cdfs = cond_probs.cumsum(axis=-1)
+
+        if native_sampling:
+          data[col] = native.sample_column(
+              [data[p] for p in proj],
+              tuple(self.domain[p] for p in proj),
+              cond_cdfs,
+              method,
+          ).astype(np.min_scalar_type(self.domain[col]))
+          continue
 
         uniques, inverse, counts, perm = _group_rows(
             current_proj_data, tuple(self.domain[c] for c in proj)

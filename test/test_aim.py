@@ -416,6 +416,41 @@ class TestMemoryMapUsage(unittest.TestCase):
         self.assertGreater(calls["n"], 0)
 
 
+class TestAIMAcceleratedEstimator(unittest.TestCase):
+  """``estimator="accelerated"`` fits the same models with a faster
+  optimizer, so results differ from the default; check they are valid and of
+  comparable quality."""
+
+  def _tv(self, data, model, workload):
+    errs = []
+    for cl, _ in workload:
+      x = np.asarray(data.project(cl).datavector())
+      y = np.asarray(model.project(cl).datavector())
+      errs.append(0.5 * np.abs(x / x.sum() - y / y.sum()).sum())
+    return float(np.mean(errs))
+
+  @parameterized.expand([("native", True), ("jax", False)])
+  def test_runs_and_fits_comparably(self, name, use_native):
+    del name
+    if use_native and not native.is_available():
+      self.skipTest("mbi native library not built")
+    data = _dataset(rows=5000, seed=10)
+    workload = [(cl, 1.0) for cl in itertools.combinations(data.domain, 2)]
+    acc = _run(aim.AIM, data, workload, estimator="accelerated",
+               use_native=use_native)
+    md = _run(aim.AIM, data, workload, use_native=use_native)
+    self.assertEqual(acc.synth.domain, data.domain)
+    self.assertAlmostEqual(float(acc.model.total), 5000, delta=250)
+    self.assertLess(
+        self._tv(data, acc.model, workload),
+        1.5 * self._tv(data, md.model, workload) + 0.01,
+    )
+
+  def test_unknown_estimator(self):
+    with self.assertRaises(ValueError):
+      aim.AIM(1.0, 1e-9, estimator="newton")
+
+
 class TestAIMIntermediateIters(unittest.TestCase):
 
   def test_fewer_intermediate_iters_runs(self):

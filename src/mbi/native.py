@@ -52,7 +52,7 @@ from .factor import Factor
 from .marginal_loss import DatavectorQuery, LinearMeasurement, MarginalLossFn
 from .markov_random_field import MarkovRandomField
 
-__all__ = ["NativeMirrorDescent", "is_available", "build", "library_path"]
+__all__ = ["NativeMirrorDescent", "NativeAcceleratedMethod", "marginal_counts", "is_available", "build", "library_path"]
 
 _LIB_NAME = {
     "darwin": "libmbi_native.dylib",
@@ -119,6 +119,12 @@ class _PlanC(ctypes.Structure):
       ("y", _P(ctypes.c_double)), ("m_sd", _P(ctypes.c_double)),
       ("m_map_off", _P(ctypes.c_uint64)), ("m_map", _P(ctypes.c_uint32)),
       ("m_bk", _P(ctypes.c_uint64)),
+      ("n_h", ctypes.c_uint64), ("h_parent", _P(ctypes.c_uint64)),
+      ("h_j", _P(ctypes.c_uint32)), ("h_off", _P(ctypes.c_uint64)),
+      ("h_map_off", _P(ctypes.c_uint64)), ("h_map", _P(ctypes.c_uint32)),
+      ("h_bk", _P(ctypes.c_uint64)), ("l_attach", _P(ctypes.c_uint64)),
+      ("mar_lead", _P(ctypes.c_uint64)), ("h_lead", _P(ctypes.c_uint64)),
+      ("src_lead", _P(ctypes.c_uint64)),
   ]
 
 
@@ -135,6 +141,21 @@ def _load():
       _P(_PlanC), _P(dbl), _P(dbl), dbl, dbl, dbl, dbl, u64, u64, dbl, _P(dbl)
   ]
   lib.mbi_mirror_descent.restype = ctypes.c_int32
+  lib.mbi_accelerated.argtypes = [
+      _P(_PlanC), _P(dbl), _P(dbl), _P(dbl), dbl, dbl, u64, u64, dbl, u64,
+      dbl, _P(dbl),
+  ]
+  lib.mbi_accelerated.restype = ctypes.c_int32
+  lib.mbi_count.argtypes = [
+      u64, _P(ctypes.c_void_p), u64, _P(u64), _P(u32), _P(u32), _P(u64),
+      _P(dbl), _P(dbl),
+  ]
+  lib.mbi_count.restype = ctypes.c_int32
+  lib.mbi_sample_column.argtypes = [
+      u64, u64, _P(ctypes.c_void_p), _P(u32), _P(dbl), u64, u32, u64,
+      _P(u32),
+  ]
+  lib.mbi_sample_column.restype = ctypes.c_int32
   lib.mbi_beliefs.argtypes = [_P(_PlanC), _P(dbl), dbl, _P(dbl)]
   lib.mbi_beliefs.restype = ctypes.c_int32
   lib.mbi_model_sizes.argtypes = [
@@ -192,6 +213,17 @@ def _block(domain: Domain, big: Clique, small: Clique) -> int:
   return block << 1 | int(kept)
 
 
+def _lead(domain: Domain, big: Clique, small: Clique) -> int:
+  """Cells of ``big`` per value of the leading attributes it shares (in the
+  same order) with ``small``; 0 if the first attributes differ. Splitting
+  ``big`` at multiples of this maps each part to a disjoint range of
+  ``small``, so read-outs can run in parallel without partial buffers."""
+  t = 0
+  while t < min(len(big), len(small)) and big[t] == small[t]:
+    t += 1
+  return math.prod(domain[a] for a in big[t:]) if t else 0
+
+
 def _offsets(sizes) -> np.ndarray:
   return np.concatenate([[0], np.cumsum(sizes, dtype=np.uint64)]).astype(
       np.uint64
@@ -222,6 +254,43 @@ class _Structure:
   tree_edges: tuple = ()
 
 
+def _build_hierarchy(domain, attrs, parent, j, leaves, nodes, attach):
+  """Greedily add intermediate tables below table ``attrs`` (see ``Hier``).
+
+  Repeatedly considers dropping one attribute: an intermediate table over
+  the remaining attributes pays off when enough of the loss cliques fit in
+  it (each is then read from / summed into the smaller table instead of the
+  big one, at the price of one extra pass over the big table). Recurses into
+  each intermediate table. ``nodes`` collects ``(attrs, parent, j)``;
+  ``attach`` maps loss-clique index -> node (``None``: the junction-tree
+  table itself).
+  """
+  remaining = list(leaves)
+  size = domain.size(attrs)
+  while True:
+    best = None
+    for a in attrs:
+      sub = tuple(x for x in attrs if x != a)
+      if not sub:
+        continue
+      covered = [it for it in remaining if a not in it[1]]
+      if len(covered) < 2:
+        continue
+      saving = len(covered) * (size - domain.size(sub)) - size
+      if best is None or saving > best[0]:
+        best = (saving, sub, covered)
+    if best is None or best[0] <= 0:
+      break
+    _, sub, covered = best
+    node = len(nodes)
+    nodes.append((sub, parent, j))
+    ids = {it[0] for it in covered}
+    remaining = [it for it in remaining if it[0] not in ids]
+    _build_hierarchy(domain, sub, node, j, covered, nodes, attach)
+  for i, _ in remaining:
+    attach[i] = parent
+
+
 @functools.lru_cache(maxsize=64)
 def _structure(
     domain: Domain, loss_cliques: tuple, measurement_cliques: tuple
@@ -246,22 +315,43 @@ def _structure(
   for m, cls in rev.items():
     for cl in cls:
       exp_parent[loss_cliques.index(cl)] = jindex[m]
+  mar_parent = np.array(
+      [_parent(cl, maximal, domain) for cl in loss_cliques], dtype=np.uint32
+  )
+  # Intermediate tables for loss cliques that are expanded into and read
+  # from the same junction-tree table.
+  nodes, attach = [], {}
+  for j, big in enumerate(maximal):
+    leaves = [
+        (i, cl) for i, cl in enumerate(loss_cliques)
+        if exp_parent[i] == j and mar_parent[i] == j
+    ]
+    _build_hierarchy(domain, big, None, j, leaves, nodes, attach)
+  attach_attrs = lambda i: (
+      nodes[attach[i]][0] if attach.get(i) is not None
+      else maximal[exp_parent[i]]
+  )
   exp_maps = [
-      _index_map(domain, maximal[exp_parent[i]], cl)
-      for i, cl in enumerate(loss_cliques)
+      _index_map(domain, attach_attrs(i), cl) for i, cl in enumerate(loss_cliques)
   ]
   exp_bk = [
-      _block(domain, maximal[exp_parent[i]], cl)
-      for i, cl in enumerate(loss_cliques)
+      _block(domain, attach_attrs(i), cl) for i, cl in enumerate(loss_cliques)
   ]
+  parent_attrs = lambda n: (
+      nodes[nodes[n][1]][0] if nodes[n][1] is not None else maximal[nodes[n][2]]
+  )
+  h_maps = [_index_map(domain, parent_attrs(n), nodes[n][0]) for n in range(len(nodes))]
+  h_bk = [_block(domain, parent_attrs(n), nodes[n][0]) for n in range(len(nodes))]
+  h_lead = [_lead(domain, parent_attrs(n), nodes[n][0]) for n in range(len(nodes))]
 
   edge_index = {e: k for k, e in enumerate(order)}
   e_src, e_dst, e_rev, sep_sizes, src_maps, dst_maps = [], [], [], [], [], []
-  src_bk, dst_bk = [], []
+  src_bk, dst_bk, src_lead = [], [], []
   for i, j in order:
     # Same layout rule as the cliques, so a message and its reverse share it.
     sep = tuple(sorted(set(i) & set(j), key=layout_key))
     src_bk.append(_block(domain, i, sep))
+    src_lead.append(_lead(domain, i, sep))
     dst_bk.append(_block(domain, j, sep))
     e_src.append(jindex[i])
     e_dst.append(jindex[j])
@@ -270,16 +360,18 @@ def _structure(
     src_maps.append(_index_map(domain, i, sep))
     dst_maps.append(_index_map(domain, j, sep))
 
-  mar_parent = np.array(
-      [_parent(cl, maximal, domain) for cl in loss_cliques], dtype=np.uint32
+  mar_attrs = lambda i: (
+      nodes[attach[i]][0] if attach.get(i) is not None
+      else maximal[mar_parent[i]]
   )
   mar_maps = [
-      _index_map(domain, maximal[mar_parent[i]], cl)
-      for i, cl in enumerate(loss_cliques)
+      _index_map(domain, mar_attrs(i), cl) for i, cl in enumerate(loss_cliques)
   ]
   mar_bk = [
-      _block(domain, maximal[mar_parent[i]], cl)
-      for i, cl in enumerate(loss_cliques)
+      _block(domain, mar_attrs(i), cl) for i, cl in enumerate(loss_cliques)
+  ]
+  mar_lead = [
+      _lead(domain, mar_attrs(i), cl) for i, cl in enumerate(loss_cliques)
   ]
 
   m_l = np.array(
@@ -327,6 +419,23 @@ def _structure(
       m_map_off=_offsets([m.size for m in m_maps]),
       m_map=cat(m_maps, np.uint32),
       m_bk=np.array(m_bk, dtype=np.uint64),
+      h_parent=np.array(
+          [n[1] if n[1] is not None else 2**64 - 1 for n in nodes],
+          dtype=np.uint64,
+      ),
+      h_j=np.array([n[2] for n in nodes], dtype=np.uint32),
+      h_off=_offsets([domain.size(n[0]) for n in nodes]),
+      h_map_off=_offsets([m.size for m in h_maps]),
+      h_map=cat(h_maps, np.uint32),
+      h_bk=np.array(h_bk, dtype=np.uint64),
+      h_lead=np.array(h_lead, dtype=np.uint64),
+      mar_lead=np.array(mar_lead, dtype=np.uint64),
+      src_lead=np.array(src_lead, dtype=np.uint64),
+      l_attach=np.array(
+          [attach[i] if attach.get(i) is not None else 2**64 - 1
+           for i in range(len(loss_cliques))],
+          dtype=np.uint64,
+      ),
   )
   return _Structure(
       arrays=arrays,
@@ -374,7 +483,11 @@ class _Plan:
         ptr(a["mar_map"], u32), ptr(a["mar_bk"], u64), s.total_clique,
         s.n_m, ptr(a["m_l"], u32), ptr(a["m_off"], u64), ptr(self.y, dbl),
         ptr(self.sd, dbl), ptr(a["m_map_off"], u64), ptr(a["m_map"], u32),
-        ptr(a["m_bk"], u64),
+        ptr(a["m_bk"], u64), len(a["h_j"]), ptr(a["h_parent"], u64),
+        ptr(a["h_j"], u32), ptr(a["h_off"], u64), ptr(a["h_map_off"], u64),
+        ptr(a["h_map"], u32), ptr(a["h_bk"], u64), ptr(a["l_attach"], u64),
+        ptr(a["mar_lead"], u64), ptr(a["h_lead"], u64),
+        ptr(a["src_lead"], u64),
     )
 
 
@@ -739,7 +852,8 @@ class NativeMirrorDescent(estimation.MirrorDescent):
       raise RuntimeError(f"mbi native library failed with status {status}")
     if os.environ.get("MBI_NATIVE_DEBUG"):
       print(f"[native] cells={int(plan.structure.arrays['j_off'][-1])} "
-            f"steps={int(info[0])} gap={info[1]:.2e}", file=sys.stderr)
+            f"steps={int(info[0])} gap={info[1]:.2e} alpha0={alpha0:.3e} "
+            f"alpha_final={info[2]:.3e} loss={info[3]:.6e}", file=sys.stderr)
     return MarkovRandomField(
         potentials=_unflatten(theta, domain, cliques),
         marginals=_unflatten(mu, domain, cliques),
@@ -752,3 +866,212 @@ if __name__ == "__main__":
     print(f"Installed {build()}")
   else:
     print(f"usage: python -m mbi.native build\nlibrary: {library_path()}")
+
+
+def _native_supports(est, loss_fn, constraints, callback_fn) -> bool:
+  """Shared checks for running an estimator natively."""
+  if not is_available() or constraints or callback_fn is not None:
+    return False
+  if est.marginal_oracle is not None or getattr(est, "mesh", None) is not None:
+    return False
+  if isinstance(loss_fn, MarginalLossFn):
+    if loss_fn.loss_fn is not marginal_loss._l2_loss:  # pylint: disable=protected-access
+      return False
+    measurements = loss_fn.data
+  else:
+    measurements = loss_fn
+  return all(
+      isinstance(m, LinearMeasurement) and isinstance(m.query, DatavectorQuery)
+      for m in measurements
+  )
+
+
+def _prepare(domain, loss_fn, known_total, warm_start):
+  """Measurements, loss_fn, total and initial (flat) potentials."""
+  if isinstance(loss_fn, MarginalLossFn):
+    measurements = list(loss_fn.data)
+  else:
+    measurements = list(loss_fn)
+    if known_total is None:
+      known_total = estimation.minimum_variance_unbiased_total(measurements)
+    loss_fn = marginal_loss.from_linear_measurements(measurements, domain)
+  if known_total is None:
+    known_total = 1.0
+  cliques = list(loss_fn.cliques)
+  if warm_start is None:
+    theta = np.zeros(sum(domain.size(cl) for cl in cliques))
+  else:
+    w_pot = (
+        warm_start
+        if isinstance(warm_start, CliqueVector)
+        else getattr(warm_start, "potentials")
+    )
+    tables = _expand_numpy(w_pot, cliques)
+    theta = np.ascontiguousarray(
+        np.concatenate([tables[cl].reshape(-1) for cl in cliques])
+    )
+  return measurements, loss_fn, float(known_total), cliques, theta
+
+
+@dataclasses.dataclass(frozen=True)
+class NativeAcceleratedMethod(estimation.UniversalAcceleratedMethod):
+  """``UniversalAcceleratedMethod`` with the optimization loop in native code.
+
+  Runs the same accelerated method (Nesterov's universal method with
+  backtracking line search) in float64 Rust, with no JIT compilation. On
+  large, badly conditioned problems, such as AIM at high row counts, it
+  reaches a given loss in roughly 10x fewer iterations than
+  ``MirrorDescent``.
+
+  Difference from the JAX version in how the final model is produced: the
+  accelerated iterate ``x`` is an average of marginals, not itself the
+  marginals of a graphical model, so the JAX version finishes with an L-BFGS
+  fit (up to 25,000 iterations) of a model to ``x``. This class instead
+  returns the model given by the method's dual potentials ``u``, whose
+  marginals are the mirror iterate ``z`` (exactly a graphical model, and
+  converging to the same optimum). Falls back to the JAX implementation in
+  the same cases as ``NativeMirrorDescent``.
+  """
+
+  def supports(self, loss_fn, constraints=(), callback_fn=None) -> bool:
+    return _native_supports(self, loss_fn, constraints, callback_fn)
+
+  def estimate(
+      self,
+      domain: Domain,
+      loss_fn,
+      known_total: float | None = None,
+      constraints: Sequence[Constraint] = (),
+      iters: int = 1000,
+      callback_fn: Callable | None = None,
+      warm_start=None,
+      tol: float | None = 1e-3,
+  ) -> MarkovRandomField:
+    if not self.supports(loss_fn, constraints, callback_fn) or not self.linesearch:
+      return super().estimate(
+          domain, loss_fn, known_total, constraints, iters, callback_fn,
+          warm_start, tol,
+      )
+    measurements, loss_fn, known_total, cliques, theta = _prepare(
+        domain, loss_fn, known_total, warm_start
+    )
+    if not cliques:
+      return super().estimate(domain, loss_fn, known_total, iters=iters)
+    theta, mu, _, _ = self._run_native(
+        domain, measurements, loss_fn, known_total, cliques, theta, iters, tol
+    )
+    return MarkovRandomField(
+        potentials=_unflatten(theta, domain, cliques),
+        marginals=_unflatten(mu, domain, cliques),
+        total=known_total,
+    )
+
+  def _run_native(
+      self, domain, measurements, loss_fn, known_total, cliques, theta, iters,
+      tol,
+  ):
+    """Returns (potentials u, total*z, total*x, info) as flat arrays."""
+    plan = _Plan(domain, cliques, measurements)
+    mu = np.empty_like(theta)
+    x = np.empty_like(theta)
+    info = np.zeros(4)
+    dbl = ctypes.c_double
+    block = estimation.CALLBACK_EVERY
+    status = _load().mbi_accelerated(
+        ctypes.byref(plan.c),
+        theta.ctypes.data_as(_P(dbl)),
+        mu.ctypes.data_as(_P(dbl)),
+        x.ctypes.data_as(_P(dbl)),
+        known_total,
+        float(loss_fn.lipschitz),
+        int(math.ceil(iters / block)) * block,
+        block,
+        float(tol) if tol is not None else -1.0,
+        int(self.max_iter_search),
+        float(self.target_acc),
+        info.ctypes.data_as(_P(dbl)),
+    )
+    if status != 0:
+      raise RuntimeError(f"mbi native library failed with status {status}")
+    if os.environ.get("MBI_NATIVE_DEBUG"):
+      print(f"[native-accel] cells={int(plan.structure.arrays['j_off'][-1])} "
+            f"steps={int(info[0])} gap={info[1]:.2e} loss_x={info[3]:.6e}",
+            file=sys.stderr)
+    return theta, mu, x, info
+
+
+def marginal_counts(data, cliques: Sequence[Clique]) -> dict:
+  """``data.project(cl).datavector()`` for every clique, in one native call.
+
+  Equivalent to projecting the dataset onto each clique (counts, or sums of
+  the dataset's weights), but computes all tables in a single multi-threaded
+  pass over the rows, without building int64 index arrays per clique. Counts
+  are exact; with non-unit weights, sums may differ in the last bits.
+
+  Returns a dict mapping each clique to its flat float64 table (row-major in
+  the clique's attribute order).
+  """
+  lib = _load()
+  if lib is None:
+    raise RuntimeError("mbi native library is not available")
+  cliques = [tuple(cl) for cl in cliques]
+  domain = data.domain
+  used = list(dict.fromkeys(a for cl in cliques for a in cl))
+  index = {a: i for i, a in enumerate(used)}
+  columns = [np.ascontiguousarray(data.data[a], dtype=np.uint32) for a in used]
+  n_rows = data.records
+  col_ptrs = (ctypes.c_void_p * max(len(columns), 1))(
+      *[c.ctypes.data for c in columns]
+  )
+  off = _offsets([len(cl) for cl in cliques])
+  attrs = np.array([index[a] for cl in cliques for a in cl], dtype=np.uint32)
+  sizes = np.array([domain[a] for cl in cliques for a in cl], dtype=np.uint32)
+  out_off = _offsets([domain.size(cl) for cl in cliques])
+  out = np.empty(int(out_off[-1]))
+  weights = None
+  if data.weights is not None and not np.all(data.weights == 1):
+    weights = np.ascontiguousarray(data.weights, dtype=np.float64)
+  ptr = lambda x, t: x.ctypes.data_as(_P(t))
+  u64, u32, dbl = ctypes.c_uint64, ctypes.c_uint32, ctypes.c_double
+  lib.mbi_count(
+      n_rows, col_ptrs, len(cliques), ptr(off, u64), ptr(attrs, u32),
+      ptr(sizes, u32), ptr(out_off, u64),
+      ptr(weights, dbl) if weights is not None else None,
+      ptr(out, dbl),
+  )
+  return {
+      cl: out[int(out_off[k]) : int(out_off[k + 1])]
+      for k, cl in enumerate(cliques)
+  }
+
+
+def sample_column(parents, sizes, cond_cdfs, method: str = "round", seed=None):
+  """Sample a synthetic column given its parent columns (native).
+
+  Native equivalent of one step of ``MarkovRandomField.synthetic_data``:
+  rows are grouped by parent configuration; with ``method="round"`` each
+  group's values follow its conditional distribution up to rounding
+  (randomly permuted ranks plus uniform noise, then the conditional CDF),
+  with ``"sample"`` values are drawn i.i.d. ``cond_cdfs`` has shape
+  ``sizes + (k,)``. ``seed`` defaults to a draw from ``np.random``, so
+  ``np.random.seed`` makes results reproducible.
+  """
+  lib = _load()
+  if lib is None:
+    raise RuntimeError("mbi native library is not available")
+  cols = [np.ascontiguousarray(p, dtype=np.uint32) for p in parents]
+  n = cols[0].size
+  k = cond_cdfs.shape[-1]
+  cdf = np.ascontiguousarray(cond_cdfs, dtype=np.float64).reshape(-1, k)
+  if seed is None:
+    seed = int(np.random.randint(0, 2**63 - 1, dtype=np.int64))
+  out = np.empty(n, dtype=np.uint32)
+  ptrs = (ctypes.c_void_p * len(cols))(*[c.ctypes.data for c in cols])
+  size_arr = np.array(sizes, dtype=np.uint32)
+  u32 = ctypes.c_uint32
+  lib.mbi_sample_column(
+      n, len(cols), ptrs, size_arr.ctypes.data_as(_P(u32)),
+      cdf.ctypes.data_as(_P(ctypes.c_double)), k,
+      0 if method == "round" else 1, seed, out.ctypes.data_as(_P(u32)),
+  )
+  return out

@@ -320,6 +320,149 @@ class TestSyntheticDataNative(unittest.TestCase):
     self.assertEqual(float(ab[0, 0]), 0.0)
 
 
+@unittest.skipUnless(native.is_available(), "mbi native library not built")
+class TestMarginalCounts(unittest.TestCase):
+
+  def _data(self, n, weights=None):
+    rng = np.random.default_rng(0)
+    domain = Domain(list("abcde"), [2, 7, 3, 16, 5])
+    data = {a: rng.integers(0, domain[a], n) for a in domain.attributes}
+    from mbi import Dataset  # pylint: disable=import-outside-toplevel
+    return Dataset(data, domain, weights=weights), domain
+
+  @parameterized.expand([(10,), (5000,), (2_500_000,)])  # last: several parts
+  def test_counts_match_project(self, n):
+    data, domain = self._data(n)
+    cliques = [("a",), ("d", "b"), ("e", "a", "c"), tuple(domain.attributes)]
+    got = native.marginal_counts(data, cliques)
+    for cl in cliques:
+      expected = np.bincount(
+          np.ravel_multi_index(tuple(data.data[a] for a in cl),
+                               domain.project(cl).shape),
+          minlength=domain.size(cl),
+      )
+      np.testing.assert_array_equal(got[cl], expected)
+
+  def test_weighted(self):
+    w = np.random.default_rng(1).random(20_000)
+    data, domain = self._data(20_000, weights=w)
+    cl = ("b", "e")
+    expected = np.bincount(
+        np.ravel_multi_index((data.data["b"], data.data["e"]), (7, 5)),
+        weights=w, minlength=35,
+    )
+    np.testing.assert_allclose(native.marginal_counts(data, [cl])[cl], expected,
+                               rtol=1e-12)
+
+
+@unittest.skipUnless(native.is_available(), "mbi native library not built")
+class TestNativeAcceleratedMethod(unittest.TestCase):
+
+  def test_x_iterate_matches_jax_float64(self):
+    domain, cliques = _MODELS["chain_with_loop"]
+    with _x64():
+      meas = _measurements(domain, cliques, seed=7)
+      loss_fn = marginal_loss.from_linear_measurements(meas, domain)
+      total = estimation.minimum_variance_unbiased_total(meas)
+      seen = []
+      estimation.UniversalAcceleratedMethod().estimate(
+          domain, loss_fn, total, iters=100, tol=None, callback_fn=seen.append
+      )
+      jax_x = seen[-1]  # total * x after 100 steps
+      est = native.NativeAcceleratedMethod()
+      cl = list(loss_fn.cliques)
+      theta = np.zeros(sum(domain.size(c) for c in cl))
+      _, mu, x, _ = est._run_native(
+          domain, meas, loss_fn, total, cl, theta, 100, None
+      )
+      x_cv = native._unflatten(x, domain, cl)
+      self.assertLess(_max_diff(jax_x, x_cv, cl) / total, 1e-6)
+      # The returned model's marginals are exactly its potentials' marginals.
+      model = est.estimate(domain, meas, iters=100, tol=None)
+      recomputed = native.oracle(model.potentials, float(model.total))
+      self.assertLess(_max_diff(model.marginals, recomputed, cl), 1e-9 * total)
+
+  def test_accelerated_iterate_fits_better_than_mirror_descent(self):
+    domain, cliques = _MODELS["chain_with_loop"]
+    with _x64():
+      meas = _measurements(domain, cliques, seed=8, total=1e6)
+      loss_fn = marginal_loss.from_linear_measurements(meas, domain)
+      total = estimation.minimum_variance_unbiased_total(meas)
+      md = native.NativeMirrorDescent().estimate(domain, meas, iters=300, tol=None)
+      md_loss = float(loss_fn(md.marginals.contract(loss_fn.cliques)))
+      cl = list(loss_fn.cliques)
+      _, _, _, info = native.NativeAcceleratedMethod()._run_native(
+          domain, meas, loss_fn, total, cl,
+          np.zeros(sum(domain.size(c) for c in cl)), 300, None,
+      )
+      self.assertLess(info[3], md_loss)  # info[3] = loss at total * x
+
+  def test_falls_back(self):
+    domain, cliques = _MODELS["chain_with_loop"]
+    meas = _measurements(domain, cliques, seed=9)
+    est = native.NativeAcceleratedMethod()
+    self.assertFalse(est.supports(meas, callback_fn=lambda mu: None))
+    calls = []
+    model = est.estimate(domain, meas, iters=60, callback_fn=calls.append)
+    self.assertIsInstance(model, MarkovRandomField)
+    self.assertGreater(len(calls), 0)
+
+
+@unittest.skipUnless(native.is_available(), "mbi native library not built")
+class TestSampleColumn(unittest.TestCase):
+
+  def _setup(self, n=60_000, seed=0):
+    rng = np.random.default_rng(seed)
+    sizes = (3, 4)
+    parents = [rng.integers(0, s, n) for s in sizes]
+    probs = rng.random(sizes + (5,))
+    probs /= probs.sum(-1, keepdims=True)
+    return parents, sizes, probs
+
+  def test_round_matches_conditional_counts(self):
+    parents, sizes, probs = self._setup()
+    out = native.sample_column(parents, sizes, probs.cumsum(-1), "round", seed=1)
+    key = parents[0] * sizes[1] + parents[1]
+    for g in range(sizes[0] * sizes[1]):
+      rows = key == g
+      counts = np.bincount(out[rows], minlength=5)
+      expected = rows.sum() * probs.reshape(-1, 5)[g]
+      # Systematic sampling: each category within ~1 of its expected count.
+      self.assertLessEqual(np.abs(counts - expected).max(), 2.0)
+
+  def test_sample_method_is_unbiased(self):
+    parents, sizes, probs = self._setup(n=400_000)
+    out = native.sample_column(parents, sizes, probs.cumsum(-1), "sample", seed=2)
+    key = parents[0] * sizes[1] + parents[1]
+    rows = key == 5
+    freq = np.bincount(out[rows], minlength=5) / rows.sum()
+    np.testing.assert_allclose(freq, probs.reshape(-1, 5)[5], atol=0.02)
+
+  def test_deterministic_given_seed(self):
+    parents, sizes, probs = self._setup()
+    a = native.sample_column(parents, sizes, probs.cumsum(-1), seed=3)
+    b = native.sample_column(parents, sizes, probs.cumsum(-1), seed=3)
+    c = native.sample_column(parents, sizes, probs.cumsum(-1), seed=4)
+    np.testing.assert_array_equal(a, b)
+    self.assertFalse(np.array_equal(a, c))
+
+  def test_synthetic_data_reproducible_with_np_seed(self):
+    domain = Domain(list("abcd"), [3, 4, 2, 5])
+    pot = CliqueVector.random(domain, [("a", "b"), ("b", "c"), ("c", "d")])
+    model = MarkovRandomField(
+        potentials=pot,
+        marginals=marginal_oracles.message_passing_stable(pot, 1000.0),
+        total=1000.0,
+    )
+    np.random.seed(11)
+    s1 = model.synthetic_data(rows=5000, use_native=True)
+    np.random.seed(11)
+    s2 = model.synthetic_data(rows=5000, use_native=True)
+    for a in domain.attributes:
+      np.testing.assert_array_equal(s1.data[a], s2.data[a])
+      self.assertEqual(s1.data[a].dtype, np.min_scalar_type(domain[a]))
+
+
 class TestWithoutLibrary(unittest.TestCase):
   """Without the native library everything falls back to the JAX code."""
 

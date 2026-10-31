@@ -249,6 +249,7 @@ class AIM(Mechanism):
         parallel_compile=None,
         intermediate_iters=None,
         use_native=None,
+        estimator="mirror_descent",
     ):
         """
         :param fuse_steps: passed to ``MirrorDescent``.  ``False`` (default)
@@ -276,6 +277,12 @@ class AIM(Mechanism):
             ``True`` when the native library is available (build it with
             ``python -m mbi.native build``); otherwise the JAX
             ``MirrorDescent`` is used with the options above.
+        :param estimator: ``"mirror_descent"`` (default, as in the AIM paper)
+            or ``"accelerated"`` (``UniversalAcceleratedMethod``; with the
+            native library, ``mbi.native.NativeAcceleratedMethod``).  The
+            accelerated method fits the same models but converges much faster
+            on large datasets, where mirror descent typically stops at
+            ``max_iters`` far from convergence; see benchmarks/aim/REPORT.md.
         """
         super(AIM, self).__init__(
             epsilon, delta, bounded=False, prng=prng or np.random
@@ -299,11 +306,26 @@ class AIM(Mechanism):
         if use_native is None:
             use_native = native.is_available()
         self.use_native = use_native
+        if estimator not in ("mirror_descent", "accelerated"):
+            raise ValueError(f"Unknown estimator {estimator!r}")
+        self.estimator = estimator
 
     def _estimate(self, domain, measurements, warm_start=None, iters=None):
         cliques = list({m.clique for m in measurements})
         jtree, _ = junction_tree.make_junction_tree(domain, cliques)
         cells = sum(domain.size(cl) for cl in junction_tree.maximal_cliques(jtree))
+        if self.estimator == "accelerated":
+            cls = (
+                native.NativeAcceleratedMethod
+                if self.use_native
+                else estimation.UniversalAcceleratedMethod
+            )
+            return cls().estimate(
+                domain,
+                merge_measurements(measurements),
+                iters=iters or self.max_iters,
+                warm_start=warm_start,
+            )
         cls = (
             native.NativeMirrorDescent
             if self.use_native
@@ -343,9 +365,21 @@ class AIM(Mechanism):
     def run(self, data, workload, num_synth_rows=None, initial_cliques=None):
         rounds = self.rounds or 16 * len(data.domain)
         candidates = compile_workload(workload)
-        answers = {
-            cl: np.asarray(data.project(cl).datavector()) for cl in candidates
-        }
+        if self.use_native:
+            answers = native.marginal_counts(data, list(candidates))
+        else:
+            answers = {
+                cl: np.asarray(data.project(cl).datavector())
+                for cl in candidates
+            }
+
+        def counts(cl):
+            # Every measured clique is a candidate, so reuse its counts
+            # instead of re-scanning the data.
+            if cl in answers:
+                return answers[cl]
+            return np.asarray(data.project(cl).datavector())
+
         size_cache = {}
 
         if not initial_cliques:
@@ -362,7 +396,7 @@ class AIM(Mechanism):
         print("Initial Sigma", sigma)
         rho_used = len(oneway) * 0.5 / sigma**2
         for cl in initial_cliques:
-            x = data.project(cl).datavector()
+            x = counts(cl)
             y = x + self.gaussian_noise(sigma, x.size)
             measurements.append(LinearMeasurement(y, cl, stddev=sigma))
 
@@ -399,7 +433,7 @@ class AIM(Mechanism):
             )
             print("Measuring Clique", cl)
             n = data.domain.size(cl)
-            x = data.project(cl).datavector()
+            x = counts(cl)
             y = x + self.gaussian_noise(sigma, n)
             measurements.append(LinearMeasurement(y, cl, stddev=sigma))
             z = _NumpyMarginals(model).datavector(cl)

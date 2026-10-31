@@ -68,6 +68,28 @@ pub struct PlanC {
     pub m_map_off: *const u64,
     pub m_map: *const u32,
     pub m_bk: *const u64,
+    /// Intermediate tables between junction-tree tables and loss cliques
+    /// (see `Hier`): count, parent (u64::MAX = the junction-tree table
+    /// `h_j`), owning junction-tree clique, sizes (offsets into scratch), and
+    /// parent -> node maps.
+    pub n_h: u64,
+    pub h_parent: *const u64,
+    pub h_j: *const u32,
+    pub h_off: *const u64,
+    pub h_map_off: *const u64,
+    pub h_map: *const u32,
+    pub h_bk: *const u64,
+    /// Per loss clique: the intermediate table it hangs from (u64::MAX = its
+    /// junction-tree table directly). Its exp/mar maps are relative to that.
+    pub l_attach: *const u64,
+    /// Per read-out map (loss-clique marginals, intermediate tables): cells
+    /// of the big table per value of the leading attributes it shares with
+    /// the small table (0 if none). Splitting the big table at multiples of
+    /// this sends each part to a disjoint range of the small table.
+    pub mar_lead: *const u64,
+    pub h_lead: *const u64,
+    /// Same for the message maps (junction-tree table -> separator).
+    pub src_lead: *const u64,
 }
 
 unsafe fn sl<'a, T>(p: *const T, n: usize) -> &'a [T] {
@@ -156,6 +178,57 @@ fn n_threads() -> usize {
             .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
             .max(1)
     })
+}
+
+// ---------------------------------------------------------------------------
+// Optional phase profiler (MBI_NATIVE_PROFILE=1): accumulates wall time per
+// phase and prints a summary to stderr at the end of each exported call.
+// ---------------------------------------------------------------------------
+
+fn profiling() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MBI_NATIVE_PROFILE").map(|v| v != "0").unwrap_or(false))
+}
+
+thread_local! {
+    static PROFILE: std::cell::RefCell<Vec<(&'static str, f64, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Time `f` under `label` when profiling is enabled.
+#[inline(always)]
+fn timed<R>(label: &'static str, f: impl FnOnce() -> R) -> R {
+    if !profiling() {
+        return f();
+    }
+    let t = std::time::Instant::now();
+    let r = f();
+    let dt = t.elapsed().as_secs_f64();
+    PROFILE.with(|p| {
+        let mut p = p.borrow_mut();
+        match p.iter_mut().find(|e| e.0 == label) {
+            Some(e) => {
+                e.1 += dt;
+                e.2 += 1;
+            }
+            None => p.push((label, dt, 1)),
+        }
+    });
+    r
+}
+
+fn report_profile(call: &str) {
+    if !profiling() {
+        return;
+    }
+    PROFILE.with(|p| {
+        let mut p = p.borrow_mut();
+        let total: f64 = p.iter().map(|e| e.1).sum();
+        eprintln!("[mbi_native profile] {call}");
+        for (label, t, n) in p.iter() {
+            eprintln!("  {:>9.1} ms {:>5.1}%  {:>7} calls  {}", t * 1e3, 100.0 * t / total.max(1e-12), n, label);
+        }
+        p.clear();
+    });
 }
 
 /// Cells per part when a large table is processed in parallel.
@@ -255,15 +328,20 @@ struct Map<'a> {
     idx: &'a [u32],
     block: usize,
     kept: bool,
+    /// See `PlanC::mar_lead` (0 = not partitionable).
+    lead: usize,
+    /// Subtracted from every small-table index (lets a part of a disjoint
+    /// parallel scatter work on its own sub-slice of the output).
+    off: usize,
 }
 
 impl<'a> Map<'a> {
     fn new(idx: &'a [u32], bk: u64) -> Map<'a> {
-        Map { idx, block: ((bk >> 1) as usize).max(1), kept: bk & 1 == 1 }
+        Map { idx, block: ((bk >> 1) as usize).max(1), kept: bk & 1 == 1, lead: 0, off: 0 }
     }
     /// The part of the map covering big cells `r`.
     fn range(&self, r: std::ops::Range<usize>) -> Map<'a> {
-        Map { idx: &self.idx[r], block: self.block, kept: self.kept }
+        Map { idx: &self.idx[r], block: self.block, kept: self.kept, lead: self.lead, off: self.off }
     }
     /// True if this map is the identity (small == big, same order).
     fn is_identity(&self, small_len: usize) -> bool {
@@ -291,11 +369,38 @@ struct Plan<'a> {
     m_inv_sd: Vec<f64>,
     m_maps: Vec<Map<'a>>,
     /// Loss cliques expanded into each junction-tree clique.
-    exp_groups: Vec<Vec<usize>>,
     /// Loss cliques whose marginal is read from each junction-tree clique.
     mar_groups: Vec<Vec<usize>>,
     /// Measurements read from each loss clique.
     m_groups: Vec<Vec<usize>>,
+    /// Intermediate-table hierarchy.
+    hier: Hier<'a>,
+}
+
+/// A hierarchy of intermediate tables per junction-tree table. Reading many
+/// small loss-clique marginals out of one huge junction-tree table costs a
+/// full pass over it per clique; instead the huge table is first projected
+/// onto a few smaller intermediate tables (subsets of its attributes), and
+/// cliques are read from the smallest table containing them. Expanding
+/// potentials is the transpose: small tables are summed into intermediate
+/// tables first, which are then broadcast into the big table.
+struct Hier<'a> {
+    off: &'a [u64],
+    maps: Vec<Map<'a>>,
+    /// Children (intermediate tables) of each junction-tree table / node.
+    j_children: Vec<Vec<usize>>,
+    h_children: Vec<Vec<usize>>,
+    /// Loss cliques attached directly to each junction-tree table / node.
+    j_leaves: Vec<Vec<usize>>,
+    h_leaves: Vec<Vec<usize>>,
+    /// Nodes of each junction-tree table, parents before children.
+    order: Vec<Vec<usize>>,
+}
+
+impl<'a> Hier<'a> {
+    fn range(&self, h: usize) -> std::ops::Range<usize> {
+        self.off[h] as usize..self.off[h + 1] as usize
+    }
 }
 
 unsafe fn maps<'a>(n: usize, off: *const u64, idx: *const u32, bk: *const u64) -> Vec<Map<'a>> {
@@ -303,6 +408,13 @@ unsafe fn maps<'a>(n: usize, off: *const u64, idx: *const u32, bk: *const u64) -
     let idx = sl(idx, off[n] as usize);
     let bk = sl(bk, n);
     (0..n).map(|i| Map::new(&idx[off[i] as usize..off[i + 1] as usize], bk[i])).collect()
+}
+
+fn with_lead<'a>(mut m: Vec<Map<'a>>, lead: &[u64]) -> Vec<Map<'a>> {
+    for (x, &l) in m.iter_mut().zip(lead) {
+        x.lead = l as usize;
+    }
+    m
 }
 
 fn groups(n: usize, parent: &[u32]) -> Vec<Vec<usize>> {
@@ -325,19 +437,60 @@ impl<'a> Plan<'a> {
             e_dst: sl(p.e_dst, n_e),
             e_rev: sl(p.e_rev, n_e),
             sep_off: sl(p.sep_off, n_e + 1),
-            src_maps: maps(n_e, p.src_map_off, p.src_map, p.src_bk),
+            src_maps: with_lead(maps(n_e, p.src_map_off, p.src_map, p.src_bk), sl(p.src_lead, n_e)),
             dst_maps: maps(n_e, p.dst_map_off, p.dst_map, p.dst_bk),
             mar_parent: sl(p.mar_parent, n_l),
-            mar_maps: maps(n_l, p.mar_map_off, p.mar_map, p.mar_bk),
+            mar_maps: with_lead(maps(n_l, p.mar_map_off, p.mar_map, p.mar_bk), sl(p.mar_lead, n_l)),
             total_clique: p.total_clique as usize,
             m_l: sl(p.m_l, n_m),
             m_off,
             y: sl(p.y, m_off[n_m] as usize),
             m_inv_sd: sl(p.m_sd, n_m).iter().map(|&s| 1.0 / s.max(1e-12)).collect(),
             m_maps: maps(n_m, p.m_map_off, p.m_map, p.m_bk),
-            exp_groups: groups(n_j, sl(p.exp_parent, n_l)),
             mar_groups: groups(n_j, sl(p.mar_parent, n_l)),
             m_groups: groups(n_l, sl(p.m_l, n_m)),
+            hier: {
+                let n_h = p.n_h as usize;
+                let parent = sl(p.h_parent, n_h);
+                let hj = sl(p.h_j, n_h);
+                let attach = sl(p.l_attach, n_l);
+                let exp_parent = sl(p.exp_parent, n_l);
+                let mut j_children = vec![Vec::new(); n_j];
+                let mut h_children = vec![Vec::new(); n_h];
+                for h in 0..n_h {
+                    if parent[h] == u64::MAX {
+                        j_children[hj[h] as usize].push(h);
+                    } else {
+                        h_children[parent[h] as usize].push(h);
+                    }
+                }
+                let mut j_leaves = vec![Vec::new(); n_j];
+                let mut h_leaves = vec![Vec::new(); n_h];
+                for i in 0..n_l {
+                    if attach[i] == u64::MAX {
+                        j_leaves[exp_parent[i] as usize].push(i);
+                    } else {
+                        h_leaves[attach[i] as usize].push(i);
+                    }
+                }
+                let mut order = vec![Vec::new(); n_j];
+                for j in 0..n_j {
+                    let mut queue: std::collections::VecDeque<usize> = j_children[j].iter().cloned().collect();
+                    while let Some(h) = queue.pop_front() {
+                        order[j].push(h);
+                        queue.extend(h_children[h].iter().cloned());
+                    }
+                }
+                Hier {
+                    off: sl(p.h_off, n_h + 1),
+                    maps: with_lead(maps(n_h, p.h_map_off, p.h_map, p.h_bk), sl(p.h_lead, n_h)),
+                    j_children,
+                    h_children,
+                    j_leaves,
+                    h_leaves,
+                    order,
+                }
+            },
         }
     }
 
@@ -370,6 +523,8 @@ struct Work {
     probs: Vec<f64>,
     /// Scratch for fused projections (several outputs at once).
     mbuf: Vec<f64>,
+    /// Intermediate tables of the hierarchy.
+    hbuf: Vec<f64>,
     messages: Vec<f64>,
     sent: Vec<bool>,
     acc: Vec<f64>,
@@ -387,11 +542,18 @@ impl Work {
         Work {
             beliefs: vec![0.0; *plan.j_off.last().unwrap() as usize],
             probs: vec![0.0; *plan.j_off.last().unwrap() as usize],
+            hbuf: vec![0.0; *plan.hier.off.last().unwrap_or(&0) as usize],
             mbuf: vec![
                 0.0;
-                plan.mar_groups
-                    .iter()
-                    .map(|g| g.iter().map(|&i| plan.l_range(i).len()).sum::<usize>())
+                (0..plan.j_off.len() - 1)
+                    .map(|j| {
+                        plan.hier.j_children[j].iter().map(|&h| plan.hier.range(h).len()).sum::<usize>()
+                            + plan.hier.j_leaves[j].iter().map(|&i| plan.l_range(i).len()).sum::<usize>()
+                    })
+                    .chain((0..plan.hier.maps.len()).map(|h| {
+                        plan.hier.h_children[h].iter().map(|&c| plan.hier.range(c).len()).sum::<usize>()
+                            + plan.hier.h_leaves[h].iter().map(|&i| plan.l_range(i).len()).sum::<usize>()
+                    }))
                     .chain(plan.m_groups.iter().map(|g| {
                         g.iter().map(|&m| (plan.m_off[m + 1] - plan.m_off[m]) as usize).sum::<usize>()
                     }))
@@ -466,7 +628,7 @@ fn scatter_max(v: &[f64], sub: Option<&[f64]>, m: Map, out: &mut [f64]) {
         match sub {
             None => {
                 for (k, &x) in v.iter().enumerate() {
-                    let o = m.idx[k] as usize;
+                    let o = m.idx[k] as usize - m.off;
                     if x > out[o] {
                         out[o] = x;
                     }
@@ -474,7 +636,7 @@ fn scatter_max(v: &[f64], sub: Option<&[f64]>, m: Map, out: &mut [f64]) {
             }
             Some(s) => {
                 for (k, &x) in v.iter().enumerate() {
-                    let o = m.idx[k] as usize;
+                    let o = m.idx[k] as usize - m.off;
                     let t = x - s[o];
                     if t > out[o] {
                         out[o] = t;
@@ -486,7 +648,7 @@ fn scatter_max(v: &[f64], sub: Option<&[f64]>, m: Map, out: &mut [f64]) {
     }
     for start in (0..v.len()).step_by(bsz) {
         let blk = &v[start..start + bsz];
-        let o = m.idx[start] as usize;
+        let o = m.idx[start] as usize - m.off;
         if m.kept {
             let out = &mut out[o..o + bsz];
             match sub {
@@ -528,7 +690,7 @@ fn scatter_sum_exp(v: &[f64], sub: Option<&[f64]>, m: Map, mx: &[f64], acc: &mut
             let b = &mut buf[..end - start];
             let idx = &m.idx[start..end];
             for (k, bk) in b.iter_mut().enumerate() {
-                let o = idx[k] as usize;
+                let o = idx[k] as usize - m.off;
                 let c = mx[o];
                 let sv = match sub {
                     None => 0.0,
@@ -538,7 +700,7 @@ fn scatter_sum_exp(v: &[f64], sub: Option<&[f64]>, m: Map, mx: &[f64], acc: &mut
             }
             exp_inplace(b);
             for (k, &bk) in b.iter().enumerate() {
-                acc[idx[k] as usize] += bk;
+                acc[idx[k] as usize - m.off] += bk;
             }
             start = end;
         }
@@ -546,7 +708,7 @@ fn scatter_sum_exp(v: &[f64], sub: Option<&[f64]>, m: Map, mx: &[f64], acc: &mut
     }
     for start in (0..v.len()).step_by(bsz) {
         let blk = &v[start..start + bsz];
-        let o = m.idx[start] as usize;
+        let o = m.idx[start] as usize - m.off;
         if m.kept {
             let mut j0 = 0;
             while j0 < bsz {
@@ -626,7 +788,7 @@ fn for_segments(m: Map, start: usize, len: usize, mut f: impl FnMut(usize, usize
     let mut p = start;
     while p < end {
         let seg = (b - p % b).min(end - p);
-        f(p - start, seg, m.idx[p] as usize);
+        f(p - start, seg, m.idx[p] as usize - m.off);
         p += seg;
     }
 }
@@ -661,7 +823,7 @@ fn broadcast_add_seg(chunk: &mut [f64], start: usize, m: Map, small: &[f64]) {
 fn scatter_sum_seg(chunk: &[f64], start: usize, m: Map, out: &mut [f64]) {
     if m.block < SMALL_BLOCK {
         for (&x, &o) in chunk.iter().zip(&m.idx[start..start + chunk.len()]) {
-            out[o as usize] += x;
+            out[o as usize - m.off] += x;
         }
         return;
     }
@@ -720,6 +882,35 @@ fn fused_scatter_sum(v: &[f64], maps: &[Map], offs: &[usize], outs: &mut [f64]) 
         return;
     }
     let rest_total: usize = rest.iter().map(|&t| offs[t + 1] - offs[t]).sum();
+    // Disjoint path: if every remaining map keeps the big table's leading
+    // attribute(s), split along them so each part writes its own output
+    // ranges directly (no partial buffers). Lead blocks are suffix products
+    // of the big table's shape, so the largest is a multiple of the others.
+    let lead = rest.iter().map(|&t| maps[t].lead).max().unwrap_or(0);
+    if v.len() >= PAR_MIN_CELLS && rest.iter().all(|&t| maps[t].lead > 0) && v.len() / lead >= 2 {
+        let n_lead = v.len() / lead;
+        let parts = n_lead.min(16);
+        let ranges: Vec<std::ops::Range<usize>> =
+            (0..parts).map(|p| (n_lead * p / parts) * lead..(n_lead * (p + 1) / parts) * lead).collect();
+        for &t in &rest {
+            let m = maps[t];
+            let outr: Vec<std::ops::Range<usize>> =
+                ranges.iter().map(|r| m.idx[r.start] as usize..m.idx[r.end - 1] as usize + 1).collect();
+            let out = &mut outs[offs[t]..offs[t + 1]];
+            par_chunks_mut(out, &outr, |o, r| {
+                let i = outr.iter().position(|q| q.start == r.start).unwrap();
+                let vr = ranges[i].clone();
+                let pm = Map { idx: &m.idx[vr.clone()], block: m.block, kept: m.kept, lead: m.lead, off: r.start };
+                let mut pos = 0;
+                for chunk in v[vr].chunks(FUSE_CHUNK) {
+                    scatter_sum_seg(chunk, pos, pm, o);
+                    pos += chunk.len();
+                }
+            });
+        }
+        return;
+    }
+
     let run = |r: std::ops::Range<usize>, o: &mut [f64], local: bool| {
         let mut pos = r.start;
         for chunk in v[r].chunks(FUSE_CHUNK) {
@@ -733,8 +924,19 @@ fn fused_scatter_sum(v: &[f64], maps: &[Map], offs: &[usize], outs: &mut [f64]) 
             pos += chunk.len();
         }
     };
-    let ranges = split(v.len(), 1);
-    if ranges.len() <= 1 || rest_total * ranges.len() > 2 * v.len() {
+    // Partials per part: use the normal partition when outputs are small,
+    // otherwise a coarse fixed partition (8 parts) so the partial buffers and
+    // their combination stay cheap relative to the pass over `v`. Both depend
+    // only on sizes, never on the thread count.
+    let mut ranges = split(v.len(), 1);
+    if ranges.len() > 1 && rest_total * ranges.len() > 2 * v.len() {
+        let parts = 8usize;
+        ranges = (0..parts).map(|p| v.len() * p / parts..v.len() * (p + 1) / parts).collect();
+        if rest_total * parts > 4 * v.len() {
+            ranges = vec![0..v.len()];
+        }
+    }
+    if ranges.len() <= 1 {
         run(0..v.len(), outs, false);
         return;
     }
@@ -798,6 +1000,44 @@ fn project_par(
     ranges: &[std::ops::Range<usize>],
 ) {
     let n = out.len();
+    // Disjoint path (see `fused_scatter_sum`): split along the leading
+    // attributes shared with the output so each part owns a disjoint output
+    // range, then reduce each part straight into its own sub-slice.
+    if m.lead > 0 && values.len() / m.lead >= 2 {
+        let n_lead = values.len() / m.lead;
+        let parts = n_lead.min(16);
+        let lr: Vec<std::ops::Range<usize>> =
+            (0..parts).map(|p| (n_lead * p / parts) * m.lead..(n_lead * (p + 1) / parts) * m.lead).collect();
+        // Output range of each part, and the map shifted to it.
+        let outr: Vec<std::ops::Range<usize>> =
+            lr.iter().map(|r| m.idx[r.start] as usize..m.idx[r.end - 1] as usize + 1).collect();
+        let part_map = |i: usize| {
+            let r = lr[i].clone();
+            Map { idx: &m.idx[r], block: m.block, kept: m.kept, lead: m.lead, off: outr[i].start }
+        };
+        out.fill(f64::NEG_INFINITY);
+        par_chunks_mut(out, &outr, |o, r| {
+            let i = outr.iter().position(|q| q.start == r.start).unwrap();
+            scatter_max(&values[lr[i].clone()], sub.map(|s| &s[r.clone()]), part_map(i), o);
+        });
+        if how == Reduce::Max {
+            return;
+        }
+        let acc = &mut acc[..n];
+        acc.fill(0.0);
+        let maxes: &[f64] = out;
+        par_chunks_mut(acc, &outr, |a, r| {
+            let i = outr.iter().position(|q| q.start == r.start).unwrap();
+            let mut buf = [0.0f64; CHUNK];
+            scatter_sum_exp(&values[lr[i].clone()], sub.map(|s| &s[r.clone()]), part_map(i), &maxes[r], a, &mut buf);
+        });
+        for (o, &a) in out.iter_mut().zip(acc.iter()) {
+            if *o != f64::NEG_INFINITY {
+                *o += a.ln();
+            }
+        }
+        return;
+    }
     let partial_max = par_map(ranges, |r| {
         let mut o = vec![f64::NEG_INFINITY; n];
         scatter_max(&values[r.clone()], sub, m.range(r), &mut o);
@@ -842,18 +1082,6 @@ fn broadcast_add_par(big: &mut [f64], m: Map, small: &[f64]) {
     par_chunks_mut(big, &ranges, |chunk, r| broadcast_add(chunk, m.range(r), small));
 }
 
-/// In-place `exp(x + shift)`, in parallel for large slices.
-#[inline(always)]
-fn exp_shift_par(v: &mut [f64], shift: f64) {
-    let ranges = split(v.len(), 1);
-    par_chunks_mut(v, &ranges, |c, _| {
-        for x in c.iter_mut() {
-            *x += shift;
-        }
-        exp_inplace(c);
-    });
-}
-
 /// Dot product, partitioned so the result doesn't depend on thread count.
 #[inline(always)]
 fn dot_par(a: &[f64], b: &[f64]) -> f64 {
@@ -886,6 +1114,34 @@ fn armijo_dot(grad: &[f64], mu: &[f64], mu2: &[f64]) -> f64 {
     .sum()
 }
 
+/// Max over a (possibly large) slice, in parallel.
+#[inline(always)]
+fn vmax_par(v: &[f64]) -> f64 {
+    let ranges = split(v.len(), 1);
+    par_map(&ranges, |r| vmax(&v[r])).into_iter().fold(f64::NEG_INFINITY, f64::max)
+}
+
+/// `out = exp(v - shift)` and returns `sum(out)`, in parallel with a fixed
+/// partition (so the sum doesn't depend on the thread count).
+#[inline(always)]
+fn exp_sum_par(v: &[f64], shift: f64, out: &mut [f64]) -> f64 {
+    let ranges = split(v.len(), 1);
+    let sums: Vec<f64> = {
+        let pieces = std::sync::Mutex::new(vec![0.0; ranges.len()]);
+        par_chunks_mut(out, &ranges, |c, r| {
+            for (o, &x) in c.iter_mut().zip(&v[r.clone()]) {
+                *o = x - shift;
+            }
+            exp_inplace(c);
+            let s = vsum(c);
+            let idx = ranges.iter().position(|q| q.start == r.start).unwrap();
+            pieces.lock().unwrap()[idx] = s;
+        });
+        pieces.into_inner().unwrap()
+    };
+    sums.iter().sum()
+}
+
 #[inline(always)]
 fn logsumexp(values: &[f64]) -> f64 {
     let m = vmax(values);
@@ -896,19 +1152,94 @@ fn logsumexp(values: &[f64]) -> f64 {
     m + sum_exp(values, m, &mut buf).ln()
 }
 
+/// Expand loss-clique potentials onto the junction-tree tables, through the
+/// intermediate-table hierarchy (children before parents).
+#[inline(always)]
+fn expand_potentials(plan: &Plan, w: &mut Work, theta: &[f64]) {
+    let h = &plan.hier;
+    for j in 0..plan.j_off.len() - 1 {
+        for &node in h.order[j].iter().rev() {
+            // Children come later in `order`, so they are already computed.
+            let mut table = vec![0.0; h.range(node).len()];
+            {
+                let mut terms: Vec<(Map, &[f64])> = h.h_leaves[node]
+                    .iter()
+                    .map(|&i| (plan.exp_maps[i], &theta[plan.l_range(i)]))
+                    .collect();
+                for &c in &h.h_children[node] {
+                    terms.push((h.maps[c], &w.hbuf[h.range(c)]));
+                }
+                fused_broadcast_set(&mut table, &terms);
+            }
+            w.hbuf[h.range(node)].copy_from_slice(&table);
+        }
+        let mut terms: Vec<(Map, &[f64])> = h.j_leaves[j]
+            .iter()
+            .map(|&i| (plan.exp_maps[i], &theta[plan.l_range(i)]))
+            .collect();
+        for &c in &h.j_children[j] {
+            terms.push((h.maps[c], &w.hbuf[h.range(c)]));
+        }
+        fused_broadcast_set(&mut w.beliefs[plan.j_range(j)], &terms);
+    }
+}
+
+/// Read loss-clique marginals out of the (unnormalized) probability tables
+/// through the hierarchy (parents before children); results are multiplied
+/// by `scale[j]` of their junction-tree table.
+#[inline(always)]
+fn read_out(plan: &Plan, w: &mut Work, scale: &[f64], mu: &mut [f64]) {
+    let h = &plan.hier;
+    for j in 0..plan.j_off.len() - 1 {
+        // (source table, its node id or None for the junction-tree table)
+        let mut stack: Vec<Option<usize>> = vec![None];
+        while let Some(src) = stack.pop() {
+            let (children, leaves) = match src {
+                None => (&h.j_children[j], &h.j_leaves[j]),
+                Some(node) => (&h.h_children[node], &h.h_leaves[node]),
+            };
+            if children.is_empty() && leaves.is_empty() {
+                continue;
+            }
+            let mut maps_: Vec<Map> = Vec::new();
+            let mut offs = vec![0usize];
+            for &c in children {
+                maps_.push(h.maps[c]);
+                offs.push(offs.last().unwrap() + h.range(c).len());
+            }
+            for &i in leaves {
+                maps_.push(plan.mar_maps[i]);
+                offs.push(offs.last().unwrap() + plan.l_range(i).len());
+            }
+            let buf = &mut w.mbuf[..*offs.last().unwrap()];
+            let table: &[f64] = match src {
+                None => &w.probs[plan.j_range(j)],
+                Some(node) => &w.hbuf[h.range(node)],
+            };
+            fused_scatter_sum(table, &maps_, &offs, buf);
+            for (t, &c) in children.iter().enumerate() {
+                let r = h.range(c);
+                w.hbuf[r].copy_from_slice(&buf[offs[t]..offs[t + 1]]);
+                stack.push(Some(c));
+            }
+            let sc = scale[j];
+            for (t, &i) in leaves.iter().enumerate() {
+                let k = children.len() + t;
+                for (o, &x) in mu[plan.l_range(i)].iter_mut().zip(&buf[offs[k]..offs[k + 1]]) {
+                    *o = x * sc;
+                }
+            }
+        }
+    }
+}
+
 /// HUGIN message passing (mirrors `marginal_oracles.message_passing_hugin`).
 /// Leaves calibrated log-beliefs in `w.beliefs`.
 #[inline(always)]
 fn calibrate(plan: &Plan, w: &mut Work, theta: &[f64], how: Reduce) {
     // Expand potentials onto the junction-tree cliques (one fused pass per
     // junction-tree clique).
-    for j in 0..plan.j_off.len() - 1 {
-        let terms: Vec<(Map, &[f64])> = plan.exp_groups[j]
-            .iter()
-            .map(|&i| (plan.exp_maps[i], &theta[plan.l_range(i)]))
-            .collect();
-        fused_broadcast_set(&mut w.beliefs[plan.j_range(j)], &terms);
-    }
+    timed("oracle: expand potentials", || expand_potentials(plan, w, theta));
     w.sent.fill(false);
     for e in 0..plan.e_src.len() {
         let (s, d) = (plan.e_src[e] as usize, plan.e_dst[e] as usize);
@@ -926,8 +1257,9 @@ fn calibrate(plan: &Plan, w: &mut Work, theta: &[f64], how: Reduce) {
         } else {
             None
         };
-        project(src, sub, plan.src_maps[e], msg, &mut w.acc, how);
-        broadcast_add_par(&mut w.beliefs[plan.j_range(d)], plan.dst_maps[e], msg);
+        let acc = &mut w.acc;
+        timed("oracle: message reduce", || project(src, sub, plan.src_maps[e], msg, acc, how));
+        timed("oracle: message broadcast", || broadcast_add_par(&mut w.beliefs[plan.j_range(d)], plan.dst_maps[e], msg));
         w.sent[e] = true;
     }
 }
@@ -940,52 +1272,35 @@ fn calibrate(plan: &Plan, w: &mut Work, theta: &[f64], how: Reduce) {
 #[inline(always)]
 fn marginals(plan: &Plan, w: &mut Work, theta: &[f64], total: f64, mu: &mut [f64]) {
     calibrate(plan, w, theta, Reduce::LogSumExp);
-    let log_total = total.ln();
-    for j in 0..plan.j_off.len() - 1 {
-        let group = &plan.mar_groups[j];
-        if group.is_empty() {
+    let n_j = plan.j_off.len() - 1;
+    let mut scale = vec![0.0; n_j];
+    for j in 0..n_j {
+        if plan.mar_groups[j].is_empty() {
             continue;
         }
+        // probs = exp(b - max(b)) in one pass (also summing it); the
+        // normalization total / sum is applied to the (small) outputs.
+        // Equivalent to exp(b - logsumexp(b) + log(total)) up to rounding,
+        // with one exp per cell instead of two.
         let jr = plan.j_range(j);
-        let shift = log_total - logsumexp(&w.beliefs[jr.clone()]);
-        let (ident, other): (Vec<usize>, Vec<usize>) = group
-            .iter()
-            .partition(|&&i| plan.mar_maps[i].is_identity(plan.l_range(i).len()));
-        // Loss cliques equal to this table: exp straight into the output.
-        for &i in &ident {
-            let out = &mut mu[plan.l_range(i)];
-            out.copy_from_slice(&w.beliefs[jr.clone()]);
-            exp_shift_par(out, shift);
-        }
-        if other.is_empty() {
-            continue;
-        }
-        let p = &mut w.probs[jr.clone()];
-        match ident.first() {
-            Some(&i) => p.copy_from_slice(&mu[plan.l_range(i)]),
-            None => {
-                p.copy_from_slice(&w.beliefs[jr]);
-                exp_shift_par(p, shift);
-            }
-        }
-        let p: &[f64] = p;
-        let maps: Vec<Map> = other.iter().map(|&i| plan.mar_maps[i]).collect();
-        let mut offs = vec![0usize];
-        for &i in &other {
-            offs.push(offs.last().unwrap() + plan.l_range(i).len());
-        }
-        let buf = &mut w.mbuf[..*offs.last().unwrap()];
-        fused_scatter_sum(p, &maps, &offs, buf);
-        for (t, &i) in other.iter().enumerate() {
-            mu[plan.l_range(i)].copy_from_slice(&buf[offs[t]..offs[t + 1]]);
-        }
+        let b = &w.beliefs[jr.clone()];
+        let m = timed("marginals: max", || vmax_par(b));
+        let p = &mut w.probs[jr];
+        let sum = timed("marginals: exp", || exp_sum_par(b, m, p));
+        scale[j] = total / sum;
     }
+    timed("marginals: read out loss cliques", || read_out(plan, w, &scale, mu));
 }
 
 /// L2 loss over identity measurements and (optionally) its gradient with
 /// respect to the loss-clique marginals (mirrors `marginal_loss._l2_loss`).
 #[inline(always)]
-fn loss_and_grad(plan: &Plan, w: &mut Work, mu: &[f64], mut grad: Option<&mut [f64]>) -> f64 {
+fn loss_and_grad(plan: &Plan, w: &mut Work, mu: &[f64], grad: Option<&mut [f64]>) -> f64 {
+    timed("loss / gradient", || loss_and_grad_inner(plan, w, mu, grad))
+}
+
+#[inline(always)]
+fn loss_and_grad_inner(plan: &Plan, w: &mut Work, mu: &[f64], mut grad: Option<&mut [f64]>) -> f64 {
     let mut loss = 0.0;
     for i in 0..plan.n_l() {
         let group = &plan.m_groups[i];
@@ -1307,6 +1622,7 @@ unsafe fn md_impl(
     }
     mu_out.copy_from_slice(&mu);
     theta.copy_from_slice(&theta_cur);
+    report_profile("mirror descent");
     info[0] = steps as f64;
     info[1] = last_gap;
     info[2] = alpha;
@@ -1500,5 +1816,491 @@ pub unsafe extern "C" fn mbi_model_sizes(
         };
         cliques.pop();
     }
+    0
+}
+
+// ---------------------------------------------------------------------------
+// Universal accelerated method (mirrors estimation.UniversalAcceleratedMethod)
+// ---------------------------------------------------------------------------
+
+/// Unit-scale loss `f(p) = loss(N p)` and optionally its gradient
+/// `N * dloss/dmu (N p)`.
+#[inline(always)]
+fn scaled_loss(plan: &Plan, w: &mut Work, p: &[f64], n_total: f64, scratch: &mut [f64], grad: Option<&mut [f64]>) -> f64 {
+    let ranges = split(p.len(), 1);
+    par_chunks_mut(scratch, &ranges, |c, r| {
+        for (x, &v) in c.iter_mut().zip(&p[r]) {
+            *x = v * n_total;
+        }
+    });
+    match grad {
+        None => loss_and_grad(plan, w, scratch, None),
+        Some(g) => {
+            let l = loss_and_grad(plan, w, scratch, Some(g));
+            par_chunks_mut(g, &ranges, |c, _| {
+                for x in c.iter_mut() {
+                    *x *= n_total;
+                }
+            });
+            l
+        }
+    }
+}
+
+/// Run `UniversalAcceleratedMethod.estimate`'s optimization loop.
+///
+/// * `theta`: initial potentials `u`; overwritten with the final dual
+///   potentials (whose unit marginals are the mirror iterate `z`).
+/// * `mu_out`: receives `total * z`, the marginals of the returned potentials.
+/// * `x_out`: receives `total * x`, the accelerated (averaged) iterate.
+/// * `info` (len 4): steps, last gap (NaN if never computed), final step
+///   size, loss at x.
+#[no_mangle]
+pub unsafe extern "C" fn mbi_accelerated(
+    plan: *const PlanC,
+    theta: *mut f64,
+    mu_out: *mut f64,
+    x_out: *mut f64,
+    total: f64,
+    lipschitz: f64,
+    iters: u64,
+    block: u64,
+    tol: f64,
+    max_iter_search: u64,
+    target_acc: f64,
+    info: *mut f64,
+) -> i32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return accel_avx2(plan, theta, mu_out, x_out, total, lipschitz, iters, block, tol, max_iter_search, target_acc, info);
+        }
+    }
+    accel_impl(plan, theta, mu_out, x_out, total, lipschitz, iters, block, tol, max_iter_search, target_acc, info)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn accel_avx2(
+    plan: *const PlanC, theta: *mut f64, mu_out: *mut f64, x_out: *mut f64, total: f64, lipschitz: f64,
+    iters: u64, block: u64, tol: f64, max_iter_search: u64, target_acc: f64, info: *mut f64,
+) -> i32 {
+    accel_impl(plan, theta, mu_out, x_out, total, lipschitz, iters, block, tol, max_iter_search, target_acc, info)
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn accel_impl(
+    plan: *const PlanC, theta: *mut f64, mu_out: *mut f64, x_out: *mut f64, total: f64, lipschitz: f64,
+    iters: u64, block: u64, tol: f64, max_iter_search: u64, target_acc: f64, info: *mut f64,
+) -> i32 {
+    let plan = Plan::new(&*plan);
+    let n = plan.n_cells();
+    let theta = slice::from_raw_parts_mut(theta, n);
+    let mu_out = slice::from_raw_parts_mut(mu_out, n);
+    let x_out = slice::from_raw_parts_mut(x_out, n);
+    let info = slice::from_raw_parts_mut(info, 4);
+    let mut w = Work::new(&plan);
+    let ranges = split(n, 1);
+
+    let mut u = theta.to_vec();
+    let mut x = vec![0.0; n];
+    marginals(&plan, &mut w, &u, 1.0, &mut x);
+    let mut z = x.clone();
+    let (mut y, mut grad, mut u2, mut z2, mut x2, mut scratch) =
+        (vec![0.0; n], vec![0.0; n], vec![0.0; n], vec![0.0; n], vec![0.0; n], vec![0.0; n]);
+    let mut gap_grad = vec![0.0; n];
+    let mut neg = vec![0.0; n];
+    let mut stepsize = 1.0 / (total * total * lipschitz);
+    let mut prev_stepsize = stepsize;
+    let mut prev_theta = -1.0f64;
+
+    let blocks = (iters + block - 1) / block.max(1);
+    let mut steps = 0u64;
+    let mut prev_gap = f64::INFINITY;
+    let mut last_gap = f64::NAN;
+    for _ in 0..blocks {
+        for _ in 0..block {
+            let mut tries = 0;
+            loop {
+                let smooth = 1.0 / stepsize;
+                let prev_smooth = 1.0 / prev_stepsize;
+                let th = if prev_theta < 0.0 {
+                    1.0
+                } else {
+                    2.0 / (1.0 + (1.0 + 4.0 * smooth / (prev_theta * prev_theta * prev_smooth)).sqrt())
+                };
+                {
+                    let (xr, zr) = (&x, &z);
+                    par_chunks_mut(&mut y, &ranges, |c, r| {
+                        for ((yy, &a), &b) in c.iter_mut().zip(&xr[r.clone()]).zip(&zr[r]) {
+                            *yy = (1.0 - th) * a + th * b;
+                        }
+                    });
+                }
+                let value_y = scaled_loss(&plan, &mut w, &y, total, &mut scratch, Some(&mut grad));
+                let coef = stepsize / th;
+                {
+                    let (ur, gr) = (&u, &grad);
+                    par_chunks_mut(&mut u2, &ranges, |c, r| {
+                        for ((o, &a), &g) in c.iter_mut().zip(&ur[r.clone()]).zip(&gr[r]) {
+                            *o = a - coef * g;
+                        }
+                    });
+                }
+                marginals(&plan, &mut w, &u2, 1.0, &mut z2);
+                {
+                    let (xr, zr) = (&x, &z2);
+                    par_chunks_mut(&mut x2, &ranges, |c, r| {
+                        for ((o, &a), &b) in c.iter_mut().zip(&xr[r.clone()]).zip(&zr[r]) {
+                            *o = (1.0 - th) * a + th * b;
+                        }
+                    });
+                }
+                let new_value = scaled_loss(&plan, &mut w, &x2, total, &mut scratch, None);
+                // <grad_y, x2 - y>
+                let d = -armijo_dot(&grad, &y, &x2);
+                let taylor = value_y + 0.5 * d;
+                let tol_eps = 5e3 * f64::EPSILON * value_y.abs() + 1e-12;
+                let accept = new_value <= taylor + 0.5 * target_acc * th + tol_eps;
+                if accept {
+                    std::mem::swap(&mut x, &mut x2);
+                    std::mem::swap(&mut z, &mut z2);
+                    std::mem::swap(&mut u, &mut u2);
+                    prev_stepsize = stepsize;
+                    stepsize *= 1.1;
+                    prev_theta = th;
+                    break;
+                }
+                stepsize *= 0.5;
+                tries += 1;
+                if tries >= max_iter_search {
+                    break;
+                }
+            }
+            steps += 1;
+        }
+        if tol >= 0.0 {
+            // Convergence check at total * x (mirrors _callback_value).
+            for k in 0..n {
+                scratch[k] = x[k] * total;
+            }
+            let gap = primal_dual_gap(&plan, &mut w, &scratch, &mut gap_grad, &mut neg, lipschitz);
+            last_gap = gap;
+            if gap <= tol || gap == prev_gap {
+                break;
+            }
+            prev_gap = gap;
+        }
+    }
+    for k in 0..n {
+        mu_out[k] = z[k] * total;
+        x_out[k] = x[k] * total;
+    }
+    theta.copy_from_slice(&u);
+    info[0] = steps as f64;
+    info[1] = last_gap;
+    info[2] = stepsize;
+    info[3] = scaled_loss(&plan, &mut w, &x, total, &mut scratch, None);
+    report_profile("accelerated method");
+    0
+}
+
+// ---------------------------------------------------------------------------
+// Marginal counting (Dataset.project(...).datavector() for many cliques)
+// ---------------------------------------------------------------------------
+
+/// Rows per chunk when counting: every clique is updated from a chunk while
+/// its columns are in cache.
+const COUNT_CHUNK: usize = 1 << 14;
+
+/// Count (or weight-sum) the rows of a columnar dataset into the
+/// contingency table of each clique.
+///
+/// * `cols[c]` points to column `c` (`n_rows` uint32 codes).
+/// * Clique `k` uses columns `attrs[off[k]..off[k+1]]` with sizes
+///   `sizes[...]` (row-major, first attribute slowest); its table is written
+///   to `out[out_off[k]..out_off[k+1]]`.
+/// * `weights` may be null (every row counts 1).
+///
+/// Rows are split into fixed chunks processed in parallel with per-chunk-group
+/// partial tables, combined in a fixed order, so results do not depend on the
+/// number of threads.
+#[no_mangle]
+pub unsafe extern "C" fn mbi_count(
+    n_rows: u64,
+    cols: *const *const u32,
+    n_cliques: u64,
+    off: *const u64,
+    attrs: *const u32,
+    sizes: *const u32,
+    out_off: *const u64,
+    weights: *const f64,
+    out: *mut f64,
+) -> i32 {
+    let n_rows = n_rows as usize;
+    let nk = n_cliques as usize;
+    let off = sl(off, nk + 1);
+    let attrs = sl(attrs, off[nk] as usize);
+    let sizes = sl(sizes, off[nk] as usize);
+    let out_off = sl(out_off, nk + 1);
+    let total = out_off[nk] as usize;
+    let out = slice::from_raw_parts_mut(out, total);
+    let n_cols = attrs.iter().map(|&a| a as usize + 1).max().unwrap_or(0);
+    let cols: Vec<&[u32]> = (0..n_cols).map(|c| sl(*cols.add(c), n_rows)).collect();
+    let weights = if weights.is_null() { None } else { Some(sl(weights, n_rows)) };
+
+    // Per-clique (column, stride) lists.
+    let plans: Vec<Vec<(usize, u32)>> = (0..nk)
+        .map(|k| {
+            let a = &attrs[off[k] as usize..off[k + 1] as usize];
+            let s = &sizes[off[k] as usize..off[k + 1] as usize];
+            let mut stride = 1u32;
+            let mut v = vec![(0usize, 0u32); a.len()];
+            for i in (0..a.len()).rev() {
+                v[i] = (a[i] as usize, stride);
+                stride *= s[i];
+            }
+            v
+        })
+        .collect();
+
+    let count_range = |r: std::ops::Range<usize>, acc: &mut [f64]| {
+        let mut idx = vec![0u32; COUNT_CHUNK];
+        let mut start = r.start;
+        while start < r.end {
+            let end = (start + COUNT_CHUNK).min(r.end);
+            let len = end - start;
+            for (k, p) in plans.iter().enumerate() {
+                let table = &mut acc[out_off[k] as usize..out_off[k + 1] as usize];
+                let ix = &mut idx[..len];
+                ix.fill(0);
+                for &(c, stride) in p {
+                    let col = &cols[c][start..end];
+                    for (x, &v) in ix.iter_mut().zip(col) {
+                        *x += v * stride;
+                    }
+                }
+                match weights {
+                    None => {
+                        for &i in ix.iter() {
+                            table[i as usize] += 1.0;
+                        }
+                    }
+                    Some(w) => {
+                        for (&i, &wt) in ix.iter().zip(&w[start..end]) {
+                            table[i as usize] += wt;
+                        }
+                    }
+                }
+            }
+            start = end;
+        }
+    };
+
+    // Fixed partition of the rows, independent of the thread count.
+    let part_rows = 1usize << 20;
+    let parts: Vec<std::ops::Range<usize>> = (0..(n_rows + part_rows - 1) / part_rows)
+        .map(|p| p * part_rows..((p + 1) * part_rows).min(n_rows))
+        .collect();
+    out.fill(0.0);
+    if parts.len() <= 1 {
+        count_range(0..n_rows, out);
+        return 0;
+    }
+    let partials = par_map(&parts, |r| {
+        let mut acc = vec![0.0; total];
+        count_range(r, &mut acc);
+        acc
+    });
+    for p in &partials {
+        for (x, &y) in out.iter_mut().zip(p) {
+            *x += y;
+        }
+    }
+    0
+}
+
+// ---------------------------------------------------------------------------
+// Synthetic data: sampling one column given its parents
+// ---------------------------------------------------------------------------
+
+/// SplitMix64: seeds independent xoshiro streams from (seed, stream id).
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// xoshiro256++ generator.
+struct Rng([u64; 4]);
+
+impl Rng {
+    fn new(seed: u64, stream: u64) -> Rng {
+        let mut s = splitmix64(seed ^ splitmix64(stream));
+        let mut st = [0u64; 4];
+        for x in st.iter_mut() {
+            s = splitmix64(s);
+            *x = s;
+        }
+        Rng(st)
+    }
+    fn next_u64(&mut self) -> u64 {
+        let s = &mut self.0;
+        let r = s[0].wrapping_add(s[3]).rotate_left(23).wrapping_add(s[0]);
+        let t = s[1] << 17;
+        s[2] ^= s[0];
+        s[3] ^= s[1];
+        s[1] ^= s[2];
+        s[0] ^= s[3];
+        s[2] ^= t;
+        s[3] = s[3].rotate_left(45);
+        r
+    }
+    /// Uniform in [0, 1).
+    fn uniform(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
+    }
+    /// Uniform integer in [0, n) (Lemire's method).
+    fn below(&mut self, n: u64) -> u64 {
+        ((self.next_u64() as u128 * n as u128) >> 64) as u64
+    }
+}
+
+/// First index `i` with `cdf[i] > u` (`np.searchsorted(cdf, u, "right")`),
+/// clamped to `len - 1`.
+#[inline(always)]
+fn upper_bound(cdf: &[f64], u: f64) -> u32 {
+    let (mut lo, mut hi) = (0usize, cdf.len());
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if cdf[mid] <= u {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo.min(cdf.len() - 1) as u32
+}
+
+#[derive(Clone, Copy)]
+struct OutPtr(*mut u32);
+unsafe impl Send for OutPtr {}
+unsafe impl Sync for OutPtr {}
+impl OutPtr {
+    /// Accessed through a method so closures capture the (Sync) wrapper.
+    fn get(&self) -> *mut u32 {
+        self.0
+    }
+}
+
+/// Sample one synthetic column given its already-generated parent columns
+/// (mirrors the per-column loop of `MarkovRandomField.synthetic_data`).
+///
+/// * Rows are grouped by parent configuration `key = ravel(parents)`.
+/// * `cdf` is the dense table of conditional CDFs, `n_configs x k`.
+/// * `method == 0` ("round"): within each group of `c` rows, row ranks are a
+///   random permutation and `u = (rank + U(0,1)) / c` (systematic sampling,
+///   so each group's counts match its conditional distribution to within
+///   rounding). `method == 1` ("sample"): `u ~ U(0,1)` i.i.d.
+/// * The value is the first category whose CDF exceeds `u`.
+///
+/// Randomness comes from xoshiro256++ streams derived from `seed` and the
+/// group (or row block), so results don't depend on the thread count.
+#[no_mangle]
+pub unsafe extern "C" fn mbi_sample_column(
+    n_rows: u64,
+    n_parents: u64,
+    parents: *const *const u32,
+    parent_sizes: *const u32,
+    cdf: *const f64,
+    k: u64,
+    method: u32,
+    seed: u64,
+    out: *mut u32,
+) -> i32 {
+    let n = n_rows as usize;
+    let k = k as usize;
+    let np_ = n_parents as usize;
+    let sizes = sl(parent_sizes, np_);
+    let cols: Vec<&[u32]> = (0..np_).map(|p| sl(*parents.add(p), n)).collect();
+    let n_configs: usize = sizes.iter().map(|&s| s as usize).product();
+    let cdf = sl(cdf, n_configs * k);
+    let outp = OutPtr(out);
+
+    // Parent configuration of every row.
+    let mut key = vec![0u32; n];
+    {
+        let mut stride = 1u32;
+        for p in (0..np_).rev() {
+            for (x, &v) in key.iter_mut().zip(cols[p]) {
+                *x += v * stride;
+            }
+            stride *= sizes[p];
+        }
+    }
+
+    if method == 1 {
+        let blocks: Vec<std::ops::Range<usize>> =
+            (0..(n + 65535) / 65536).map(|b| b * 65536..((b + 1) * 65536).min(n)).collect();
+        par_map(&blocks, |r| {
+            let mut rng = Rng::new(seed, r.start as u64);
+            for row in r {
+                let g = key[row] as usize;
+                let u = rng.uniform();
+                *outp.get().add(row) = upper_bound(&cdf[g * k..(g + 1) * k], u);
+            }
+        });
+        return 0;
+    }
+
+    // Counting sort of rows by key.
+    let mut start = vec![0u32; n_configs + 1];
+    for &g in &key {
+        start[g as usize + 1] += 1;
+    }
+    for g in 0..n_configs {
+        start[g + 1] += start[g];
+    }
+    let mut fill = start.clone();
+    let mut order = vec![0u32; n];
+    for (row, &g) in key.iter().enumerate() {
+        let pos = &mut fill[g as usize];
+        order[*pos as usize] = row as u32;
+        *pos += 1;
+    }
+
+    // Groups in fixed batches of configurations; each group shuffles its rows
+    // with its own stream and assigns values.
+    let batch = ((n_configs + 63) / 64).max(1);
+    let ranges: Vec<std::ops::Range<usize>> =
+        (0..(n_configs + batch - 1) / batch).map(|b| b * batch..((b + 1) * batch).min(n_configs)).collect();
+    let order_ptr = OutPtr(order.as_mut_ptr());
+    let start = &start;
+    par_map(&ranges, |r| {
+        for g in r {
+            let (s, e) = (start[g] as usize, start[g + 1] as usize);
+            let c = e - s;
+            if c == 0 {
+                continue;
+            }
+            // Disjoint slice of `order` per group.
+            let rows = std::slice::from_raw_parts_mut(order_ptr.get().add(s), c);
+            let mut rng = Rng::new(seed, g as u64);
+            for i in (1..c).rev() {
+                let j = rng.below(i as u64 + 1) as usize;
+                rows.swap(i, j);
+            }
+            let cdf_g = &cdf[g * k..(g + 1) * k];
+            let inv = 1.0 / c as f64;
+            for (rank, &row) in rows.iter().enumerate() {
+                let u = (rank as f64 + rng.uniform()) * inv;
+                *outp.get().add(row as usize) = upper_bound(cdf_g, u);
+            }
+        }
+    });
     0
 }
